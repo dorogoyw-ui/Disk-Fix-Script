@@ -102,7 +102,7 @@ Disk Fix Script — это мощный инструмент для работы
 
 ```bash
 # Скачать скрипт
-wget https://raw.githubusercontent.com/yourrepo/disk-fix/main/disk_fix.sh
+wget https://raw.githubusercontent.com/dorogoyw-ui/Disk-Fix-Script/main/disk_fix.sh
 
 # Сделать исполняемым
 chmod +x disk_fix.sh
