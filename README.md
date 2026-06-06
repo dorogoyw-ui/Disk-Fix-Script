@@ -295,61 +295,8 @@ text
 
 📁 Создавать, переименовывать, удалять файлы и папки
 
-Создание сетевого диска (для удобства)
+# Скрипты mount_ext4.cmd и unmount_ext4.cmd предназначены для автоматического монтирования/демонтирования ext4 дисков в Windows. После монтирования открывается проводник с корнем примонтированного диска.
 ```
-# В командной строке (cmd) от имени администратора
-net use Z: \\wsl.localhost\Ubuntu\mnt\ext4_disk
-Теперь диск Z: будет отображаться в "Мой компьютер".
-
-Полный скрипт автоматизации для WSL
-Создайте файл wsl_mount_and_fix.bat:
-
-batch
-@echo off
-echo === WSL Disk Fix Helper ===
-echo.
-
-set /p DISK_NUM="Введите номер диска (например 1 для PHYSICALDRIVE1): "
-
-if "%DISK_NUM%"=="" (
-    echo Отмена
-    exit /b
-)
-
-echo Монтирование диска PHYSICALDRIVE%DISK_NUM%...
-wsl --mount \\.\PHYSICALDRIVE%DISK_NUM% --bare
-
-timeout /t 3 /nobreak >nul
-
-wsl bash -c "
-    NEW_DEVICE=\$(lsblk -l | grep -E '^sd[a-z]' | tail -1 | awk '{print \"/dev/\"\$1}')
-    echo \"Обнаружено устройство: \$NEW_DEVICE\"
-    
-    MOUNT_POINT=\"/mnt/ext4_disk_\${NEW_DEVICE##*/}\"
-    sudo mkdir -p \"\$MOUNT_POINT\"
-    sudo mount -t ext4 \${NEW_DEVICE}1 \"\$MOUNT_POINT\"
-    
-    echo \"Диск примонтирован в: \$MOUNT_POINT\"
-    echo \"Доступ в Windows: \\\\wsl.localhost\\Ubuntu\$MOUNT_POINT\"
-    
-    cd \"\$MOUNT_POINT\"
-    
-    if [ ! -f disk_fix.sh ]; then
-        echo \"Копирование скрипта...\"
-        cp /home/*/disk_fix.sh . 2>/dev/null || wget https://raw.githubusercontent.com/yourrepo/disk-fix/main/disk_fix.sh
-        chmod +x disk_fix.sh
-    fi
-    
-    sudo ./disk_fix.sh
-    
-    read -p \"Отмонтировать диск? (y/n): \" UNMOUNT
-    if [[ \"\$UNMOUNT\" =~ ^[Yy] ]]; then
-        sudo umount \"\$MOUNT_POINT\"
-        echo \"Диск отмонтирован\"
-    fi
-"
-
-pause
 Часто задаваемые вопросы по WSL
 ❓ Как узнать номер диска для wsl --mount?
 powershell
