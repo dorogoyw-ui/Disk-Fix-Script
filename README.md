@@ -279,32 +279,6 @@ text
 📁 Создавать, переименовывать, удалять файлы и папки
 
 # Скрипты mount_ext4.cmd и unmount_ext4.cmd предназначены для автоматического монтирования/демонтирования ext4 дисков в Windows. После монтирования открывается проводник с корнем примонтированного диска.
-```
-Часто задаваемые вопросы по WSL
-❓ Как узнать номер диска для wsl --mount?
-powershell
-# В PowerShell
-wmic diskdrive list brief
-# Или
-Get-PhysicalDisk | Select-Object DeviceNumber, FriendlyName, Size
-❓ Диск не виден в WSL после wsl --mount
-powershell
-# Перезапустите WSL
-wsl --shutdown
-
-# Затем заново примонтируйте
-wsl --mount \\.\PHYSICALDRIVE1 --bare
-❓ Ошибка "The disk is in use"
-powershell
-# Отключите диск от Windows
-diskpart
-select disk 1
-offline disk
-exit
-
-# Теперь монтируйте в WSL
-wsl --mount \\.\PHYSICALDRIVE1
-```
 
 📄 Лицензия
 MIT License
