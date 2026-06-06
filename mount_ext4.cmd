@@ -32,6 +32,9 @@ echo         Write-Host "SUCCESS! Real ext4 partition found on: $($disk.Model)" 
 echo         $ext4Found = $true >> "%ps_file%"
 echo         $mountName = "PHYSICALDRIVE" + $diskNumber + "p1" >> "%ps_file%"
 echo         $targetWindowsPath = "\\wsl.localhost\$wslDefaultDistro\mnt\wsl\$mountName" >> "%ps_file%"
+echo         Write-Host "2. Granting full read/write permissions for File Explorer..." -ForegroundColor Cyan >> "%ps_file%"
+echo         $null = wsl -u root bash -c "chmod 777 /mnt/wsl/$mountName 2>/dev/null" >> "%ps_file%"
+echo         $null = wsl -u root bash -c "chown -R 1000:1000 /mnt/wsl/$mountName 2>/dev/null" >> "%ps_file%"
 echo         Write-Host "Opening folder in Explorer: $targetWindowsPath" -ForegroundColor Green >> "%ps_file%"
 echo         Start-Sleep -Seconds 2 >> "%ps_file%"
 echo         explorer.exe $targetWindowsPath >> "%ps_file%"
@@ -49,7 +52,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%ps_file%"
 :: 5. Удаляем временный файл после выполнения
 if exist "%ps_file%" del /f /q "%ps_file%"
 
-:: 6. Пауза в самом конце (теперь текст отобразится идеально)
+:: 6. Пауза в самом конце
 echo.
 echo ===================================================
 echo Скрипт завершил работу.
