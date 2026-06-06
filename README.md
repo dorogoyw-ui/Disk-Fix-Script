@@ -215,21 +215,7 @@ wsl --mount \\.\PHYSICALDRIVE2 --bare
 # 3. Проверьте в WSL
 wsl
 lsblk
-# Должен появиться /dev/sdc или /dev/sdd
-Способ 2: Через USB/IP (для USB-дисков)
-powershell
-# 1. Установите usbipd-win
-winget install --interactive --exact dorssel.usbipd-win
 
-# 2. Перезагрузите компьютер
-
-# 3. В PowerShell (администратор) привяжите USB-устройство
-usbipd wsl list
-usbipd wsl attach --busid <BUSID>
-
-# 4. В WSL устройство появится как /dev/sdX
-Монтирование ext4 раздела в WSL
-bash
 # 1. Зайдите в WSL
 wsl
 
