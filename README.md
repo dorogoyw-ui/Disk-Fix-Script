@@ -210,12 +210,9 @@ wmic diskdrive list brief
 # WDC WD10EZEX               \\.\PHYSICALDRIVE1  1000204886016
 
 # 2. Примонтируйте диск (например, диск 1)
-wsl --mount \\.\PHYSICALDRIVE1
+wsl --mount \\.\PHYSICALDRIVE2 --bare
 
-# 3. Или примонтируйте конкретный раздел
-wsl --mount \\.\PHYSICALDRIVE1 --partition 1
-
-# 4. Проверьте в WSL
+# 3. Проверьте в WSL
 wsl
 lsblk
 # Должен появиться /dev/sdc или /dev/sdd
