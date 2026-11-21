@@ -66,10 +66,17 @@ fi
 # ---------- 4. Зона firewall ----------
 echo
 echo "--- 4. Зона firewall awg ---"
-idx=$(uci show firewall 2>/dev/null | grep -oE "@zone\[[0-9]+\]\.name='awg'" | grep -oE '[0-9]+' | head -1)
+idx=""
+for i in $(uci show firewall 2>/dev/null | grep -oE '@zone\[[0-9]+\]=zone' | grep -oE '[0-9]+'); do
+    if [ "$(uci -q get firewall.@zone[$i].name)" = "awg" ]; then
+        idx="$i"
+        break
+    fi
+done
+
 if [ -n "$idx" ]; then
     pass "зона awg существует (index $idx)"
-    uci show firewall.@zone[$idx] 2>/dev/null | grep -q "list network 'awg'" \
+    uci -q get firewall.@zone[$idx].network 2>/dev/null | grep -qw 'awg' \
         && pass "  zone.network содержит awg" \
         || err "  zone.network НЕ содержит awg (добавьте: uci add_list firewall.@zone[$idx].network='awg')"
     [ "$(uci -q get firewall.@zone[$idx].masq)" = "1" ] && pass "  masq=1" || warn_ "  masq=$(uci -q get firewall.@zone[$idx].masq)"
@@ -82,7 +89,13 @@ fi
 # ---------- 5. Forwarding ----------
 echo
 echo "--- 5. Forwarding lan -> awg ---"
-cnt=$(uci show firewall 2>/dev/null | grep -c "forwarding\[[0-9]\+\]\.dest='awg'")
+cnt=0
+for i in $(uci show firewall 2>/dev/null | grep -oE '@forwarding\[[0-9]+\]=forwarding' | grep -oE '[0-9]+'); do
+    if [ "$(uci -q get firewall.@forwarding[$i].dest)" = "awg" ]; then
+        cnt=$((cnt+1))
+    fi
+done
+
 if [ "$cnt" -eq 0 ]; then
     err "forwarding lan -> awg отсутствует"
 elif [ "$cnt" -eq 1 ]; then
@@ -90,7 +103,7 @@ elif [ "$cnt" -eq 1 ]; then
 else
     warn_ "forwarding lan -> awg: $cnt шт. (дубли, удалите лишние)"
 fi
-# Проверяем, что fw4 сгенерировал accept_to_awg
+
 if nft list chain inet fw4 forward_lan 2>/dev/null | grep -q 'accept_to_awg\|oifname "awg" accept'; then
     pass "fw4 сгенерировал accept_to_awg в forward_lan"
 else

@@ -26,11 +26,10 @@ TMP_IPS="/tmp/awg_ips.tmp"
 TMP_NFT="/tmp/99-awg-domains.nft"
 
 # ==================== ХЕЛПЕРЫ ====================
-log() { logger -t awg-setup "$*"; echo "$*"; }
+log() { logger -t awg-setup "$*"; echo "$*" >&2; }
 die() { log "ОШИБКА: $*"; rollback; exit 1; }
 
 # Откат: удаляем ТОЛЬКО то, что создал скрипт (правило, include, nft-файл, маршрут в table 100).
-# Зону awg, forwarding lan->awg, auto='1' НЕ трогаем — они могли быть настроены до скрипта.
 rollback() {
     log "Откат изменений, внесённых скриптом..."
     uci -q delete network.awg_rule 2>/dev/null || true
@@ -43,7 +42,7 @@ rollback() {
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
-# Резолв через системный dnsmasq (127.0.0.1:53). Без второго аргумента (1.1.1.1 игнорируется musl).
+# Резолв через системный dnsmasq (127.0.0.1:53). Без второго аргумента.
 resolve_host() {
     host="$1"
     if command -v timeout >/dev/null 2>&1; then
@@ -122,14 +121,19 @@ chain mangle_prerouting_awg {
 NFT_EOF
 }
 
-# Найти индекс зоны awg в firewall (или создать)
+# Найти индекс зоны awg в firewall (или создать). Возвращает индекс в stdout.
 ensure_awg_zone() {
-    # Ищем зону с именем awg
-    idx=$(uci show firewall | grep -oE "@zone\[[0-9]+\]\.name='awg'" | grep -oE '[0-9]+' | head -1)
+    idx=""
+    for i in $(uci show firewall | grep -oE '@zone\[[0-9]+\]=zone' | grep -oE '[0-9]+'); do
+        if [ "$(uci -q get firewall.@zone[$i].name)" = "$AWG_ZONE_NAME" ]; then
+            idx="$i"
+            break
+        fi
+    done
+
     if [ -z "$idx" ]; then
-        # Создаём зону
         uci add firewall zone >/dev/null
-        idx=$(( $(uci show firewall | grep -c '^firewall.@zone\[') - 1 ))
+        idx=$(( $(uci show firewall | grep -cE '@zone\[[0-9]+\]=zone') - 1 ))
         uci set firewall.@zone[$idx].name="$AWG_ZONE_NAME"
         uci set firewall.@zone[$idx].input='REJECT'
         uci set firewall.@zone[$idx].output='ACCEPT'
@@ -141,31 +145,41 @@ ensure_awg_zone() {
     else
         log "  зона $AWG_ZONE_NAME уже существует (index $idx)"
     fi
+
     # Привязываем интерфейс awg к зоне, если ещё не привязан
-    if ! uci show firewall.@zone[$idx] 2>/dev/null | grep -q "list network 'awg'"; then
+    if ! uci -q get firewall.@zone[$idx].network 2>/dev/null | grep -qw 'awg'; then
         uci add_list firewall.@zone[$idx].network='awg'
         log "  зона $AWG_ZONE_NAME привязана к интерфейсу awg"
     fi
+
     # Убеждаемся, что masq/mtu_fix/forward включены
     uci set firewall.@zone[$idx].masq='1'
     uci set firewall.@zone[$idx].mtu_fix='1'
     uci set firewall.@zone[$idx].forward='ACCEPT'
+
     echo "$idx"
 }
 
 # Убедиться, что forwarding lan -> awg существует и он один
 ensure_forwarding() {
-    # Удаляем все дубли forwarding lan->awg, оставляем один
-    count=$(uci show firewall | grep -c "forwarding\[[0-9]\+\]\.dest='awg'")
+    indices=""
+    for i in $(uci show firewall | grep -oE '@forwarding\[[0-9]+\]=forwarding' | grep -oE '[0-9]+'); do
+        if [ "$(uci -q get firewall.@forwarding[$i].dest)" = "$AWG_ZONE_NAME" ]; then
+            indices="$indices $i"
+        fi
+    done
+
+    count=0
+    [ -n "$indices" ] && count=$(echo "$indices" | wc -w)
+
     if [ "$count" -eq 0 ]; then
         uci add firewall forwarding >/dev/null
         uci set firewall.@forwarding[-1].src='lan'
         uci set firewall.@forwarding[-1].dest="$AWG_ZONE_NAME"
         log "  добавлен forwarding lan -> $AWG_ZONE_NAME"
     elif [ "$count" -gt 1 ]; then
-        # Удаляем все, кроме первого
         first=1
-        for i in $(uci show firewall | grep -oE "forwarding\[[0-9]+\]\.dest='awg'" | grep -oE '[0-9]+'); do
+        for i in $indices; do
             if [ "$first" = "1" ]; then
                 first=0
                 continue
@@ -185,7 +199,6 @@ command -v nft >/dev/null 2>&1 || die "nft не найден (нужен fw4/nft
 command -v uci >/dev/null 2>&1 || die "uci не найден"
 uci -q get network.awg >/dev/null 2>&1 || die "network.awg не настроен — сначала настройте AmneziaWG в LuCI"
 
-# dnsmasq
 if ! timeout "$DNS_TIMEOUT" nslookup google.com >/dev/null 2>&1; then
     log "ВНИМАНИЕ: dnsmasq не отвечает — перезапускаю..."
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
@@ -211,30 +224,24 @@ cp "$TMP_NFT" "$NFT_FILE"
 # ==================== 5. UCI ====================
 log "5. Применение uci-настроек..."
 
-# 5a. rt_tables
 grep -q "$RT_TABLE_ID $RT_TABLE_NAME" /etc/iproute2/rt_tables \
     || echo "$RT_TABLE_ID $RT_TABLE_NAME" >> /etc/iproute2/rt_tables
 
-# 5b. auto='1' для awg
 if [ "$(uci -q get network.awg.auto)" != "1" ]; then
     uci set network.awg.auto='1'
     log "  network.awg.auto=1"
 fi
 
-# 5c. Зона awg + привязка network='awg'
 ZONE_IDX=$(ensure_awg_zone)
 log "  зона awg: index $ZONE_IDX"
 
-# 5d. Forwarding lan -> awg (ровно один)
 ensure_forwarding
 
-# 5e. Правило fwmark -> table 100
 uci -q delete network.awg_rule
 uci set network.awg_rule=rule
 uci set network.awg_rule.mark="$FWMARK"
 uci set network.awg_rule.lookup="$RT_TABLE_ID"
 
-# 5f. Include nft-файла в fw4
 uci -q delete firewall.$NFT_INCLUDE_NAME
 uci set firewall.$NFT_INCLUDE_NAME=include
 uci set firewall.$NFT_INCLUDE_NAME.type='nftables'
@@ -244,11 +251,9 @@ uci set firewall.$NFT_INCLUDE_NAME.position='table-append'
 uci commit network
 uci commit firewall
 
-# 5g. Применение
 /etc/init.d/firewall restart >/dev/null 2>&1 || log "ВНИМАНИЕ: firewall restart вернул ошибку"
 /etc/init.d/network reload   >/dev/null 2>&1 || log "ВНИМАНИЕ: network reload вернул ошибку"
 
-# 5h. Гарантия маршрута в таблице 100 (только если awg поднят)
 sleep 1
 if ip link show awg >/dev/null 2>&1; then
     if ! ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
@@ -265,7 +270,6 @@ fi
 log "6. Установка $UPDATE_SCRIPT..."
 cat > "$UPDATE_SCRIPT" << 'UPD_EOF'
 #!/bin/sh
-# update_awg_domains.sh — обновление списка и nft-сета
 LIST_URL="__LIST_URL__"
 LIST_MIRRORS="__MIRRORS__"
 DNS_TIMEOUT="__DNS_TIMEOUT__"
