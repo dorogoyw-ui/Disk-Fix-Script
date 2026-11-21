@@ -1,5 +1,6 @@
 #!/bin/sh
-# setup_vpn.sh — AmneziaWG: зона firewall, forwarding, fwmark->table 100, nft-set, cron
+# setup_vpn.sh — AmneziaWG: зона, forwarding, fwmark->table 100, nft-set, cron
+# Автоматически: включает route_allowed_ips для handshake, ждёт его, затем снимает.
 # Предполагается: network.awg уже настроен (proto amneziawg, пир, ключи).
 
 set -e
@@ -16,6 +17,7 @@ RT_TABLE_ID="100"
 RT_TABLE_NAME="awg_vpn"
 FWMARK="0x1"
 DNS_TIMEOUT="5"
+HANDSHAKE_TIMEOUT="30"
 NFT_FILE="/etc/nftables.d/99-awg-domains.nft"
 NFT_INCLUDE_NAME="awg_domains"
 AWG_ZONE_NAME="awg"
@@ -25,7 +27,6 @@ TMP_IPS="/tmp/awg_ips.tmp"
 TMP_NFT="/tmp/99-awg-domains.nft"
 
 # ==================== ХЕЛПЕРЫ ====================
-# log пишет в stderr — чтобы не попадать в stdout функций, возвращающих значение
 log() { logger -t awg-setup "$*"; echo "$*" >&2; }
 die() { log "ОШИБКА: $*"; rollback; exit 1; }
 
@@ -116,7 +117,6 @@ chain mangle_prerouting_awg {
 NFT_EOF
 }
 
-# Возвращает индекс зоны awg в stdout (без логов)
 ensure_awg_zone() {
     idx=""
     for i in $(uci show firewall | grep -oE '@zone\[[0-9]+\]=zone' | grep -oE '[0-9]+'); do
@@ -184,11 +184,26 @@ ensure_forwarding() {
     fi
 }
 
+# Ждём handshake до $HANDSHAKE_TIMEOUT секунд. Возвращает 0, если появился.
+wait_handshake() {
+    elapsed=0
+    while [ "$elapsed" -lt "$HANDSHAKE_TIMEOUT" ]; do
+        if awg show 2>/dev/null | grep -q 'latest handshake'; then
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+        log "  ожидание handshake... ${elapsed}s"
+    done
+    return 1
+}
+
 # ==================== 1. ПРОВЕРКА ====================
 log "1. Проверка окружения..."
 [ -f /etc/iproute2/rt_tables ] || die "/etc/iproute2/rt_tables не найден"
 command -v nft >/dev/null 2>&1 || die "nft не найден (нужен fw4/nftables)"
 command -v uci >/dev/null 2>&1 || die "uci не найден"
+command -v awg >/dev/null 2>&1 || die "awg не найден (amneziawg-tools)"
 uci -q get network.awg >/dev/null 2>&1 || die "network.awg не настроен — сначала настройте AmneziaWG в LuCI"
 
 if ! timeout "$DNS_TIMEOUT" nslookup google.com >/dev/null 2>&1; then
@@ -197,24 +212,41 @@ if ! timeout "$DNS_TIMEOUT" nslookup google.com >/dev/null 2>&1; then
     sleep 2
 fi
 
-# ==================== 2. СКАЧИВАНИЕ ====================
-log "2. Скачивание списка..."
+# ==================== 2. HANDSHAKE ====================
+log "2. Обеспечение handshake..."
+# Включаем route_allowed_ips (галочку), чтобы kmod применил параметры пира
+uci set network.@amneziawg_awg[0].route_allowed_ips='1'
+uci commit network
+ifup awg >/dev/null 2>&1 || true
+log "  route_allowed_ips=1, ifup awg, ждём handshake..."
+
+if ! wait_handshake; then
+    log "ВНИМАНИЕ: handshake не появился за ${HANDSHAKE_TIMEOUT}s."
+    log "  Проверьте: ключи, параметры обфускации (jc/jmin/jmax/s1/s2/h1-h4/i1),"
+    log "  endpoint (8.35.211.5:3581), системное время, доступность UDP."
+    log "  Скрипт продолжит, но маршрут в table $RT_TABLE_ID может не работать."
+else
+    log "  handshake появился, туннель активен"
+fi
+
+# ==================== 3. СКАЧИВАНИЕ ====================
+log "3. Скачивание списка..."
 rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
 fetch_list "$TMP_RAW" || die "не удалось скачать список ни с одного зеркала"
 
-# ==================== 3. ПАРСИНГ ====================
-log "3. Парсинг списка..."
+# ==================== 4. ПАРСИНГ ====================
+log "4. Парсинг списка..."
 parse_list "$TMP_RAW" "$TMP_IPS" || die "не удалось получить ни одного IP"
 IP_COUNT=$(wc -l < "$TMP_IPS" 2>/dev/null || echo 0)
 log "  получено IP/CIDR: $IP_COUNT"
 
-# ==================== 4. NFT ====================
-log "4. Генерация nft-конфига..."
+# ==================== 5. NFT ====================
+log "5. Генерация nft-конфига..."
 gen_nft "$TMP_IPS" "$TMP_NFT" || die "не удалось сгенерировать nft-конфиг"
 cp "$TMP_NFT" "$NFT_FILE"
 
-# ==================== 5. UCI ====================
-log "5. Применение uci-настроек..."
+# ==================== 6. UCI ====================
+log "6. Применение uci-настроек..."
 
 grep -q "$RT_TABLE_ID $RT_TABLE_NAME" /etc/iproute2/rt_tables \
     || echo "$RT_TABLE_ID $RT_TABLE_NAME" >> /etc/iproute2/rt_tables
@@ -229,7 +261,6 @@ log "  зона awg: index $ZONE_IDX"
 
 ensure_forwarding
 
-# ВАЖНО: || true после каждого uci -q delete
 uci -q delete network.awg_rule 2>/dev/null || true
 uci set network.awg_rule=rule
 uci set network.awg_rule.mark="$FWMARK"
@@ -247,20 +278,42 @@ uci commit firewall
 /etc/init.d/firewall restart >/dev/null 2>&1 || log "ВНИМАНИЕ: firewall restart вернул ошибку"
 /etc/init.d/network reload   >/dev/null 2>&1 || log "ВНИМАНИЕ: network reload вернул ошибку"
 
+# ==================== 7. МАРШРУТ В TABLE 100 ====================
+log "7. Маршрут в таблице $RT_TABLE_ID..."
 sleep 1
 if ip link show awg >/dev/null 2>&1; then
     if ! ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
-        log "  маршрут в таблице $RT_TABLE_ID отсутствует — создаю вручную"
         ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null \
             || log "  ВНИМАНИЕ: не удалось создать маршрут"
+        log "  маршрут создан вручную"
+    else
+        log "  маршрут уже есть"
     fi
 else
-    log "  ВНИМАНИЕ: интерфейс awg не поднят — маршрут в таблице $RT_TABLE_ID не создан"
-    log "  выполните: ifup awg && sh $0"
+    log "  ВНИМАНИЕ: awg не поднят — маршрут не создан"
 fi
 
-# ==================== 6. UPDATE-СКРИПТ ====================
-log "6. Установка $UPDATE_SCRIPT..."
+# ==================== 8. СНЯТИЕ ГАЛОЧКИ ====================
+log "8. Снятие route_allowed_ips (галочки)..."
+uci set network.@amneziawg_awg[0].route_allowed_ips='0'
+uci commit network
+ifup awg >/dev/null 2>&1 || true
+sleep 3
+
+if awg show 2>/dev/null | grep -q 'latest handshake'; then
+    log "  handshake сохранился — выборочная маршрутизация активна"
+else
+    log "  ВНИМАНИЕ: handshake пропал после снятия галочки."
+    log "  На этой прошивке выборочная маршрутизация невозможна."
+    log "  Возвращаю route_allowed_ips=1 (полный туннель)..."
+    uci set network.@amneziawg_awg[0].route_allowed_ips='1'
+    uci commit network
+    ifup awg >/dev/null 2>&1 || true
+    log "  полный туннель восстановлен"
+fi
+
+# ==================== 9. UPDATE-СКРИПТ ====================
+log "9. Установка $UPDATE_SCRIPT..."
 cat > "$UPDATE_SCRIPT" << 'UPD_EOF'
 #!/bin/sh
 LIST_URL="__LIST_URL__"
@@ -352,14 +405,18 @@ sed -i "s|__MIRRORS__|$MIRRORS_ONELINE|" "$UPDATE_SCRIPT"
 sed -i "s|__DNS_TIMEOUT__|$DNS_TIMEOUT|" "$UPDATE_SCRIPT"
 chmod +x "$UPDATE_SCRIPT"
 
-# ==================== 7. CRON ====================
-log "7. Настройка cron (04:00 ежедневно)..."
+# ==================== 10. CRON ====================
+log "10. Настройка cron..."
 mkdir -p /etc/crontabs
 touch /etc/crontabs/root
 sed -i "\|$UPDATE_SCRIPT|d" /etc/crontabs/root
 echo "0 4 * * * $UPDATE_SCRIPT" >> /etc/crontabs/root
+# восстановление маршрута в table 100 после перезагрузки
+sed -i '\|ip route replace default dev awg table '"$RT_TABLE_ID"'|d' /etc/crontabs/root
+echo "@reboot sleep 30 && ip route replace default dev awg table $RT_TABLE_ID" >> /etc/crontabs/root
 /etc/init.d/cron enable
 /etc/init.d/cron restart
 
-log "Готово. Список загружен ($IP_COUNT IP), зона awg настроена, forwarding lan->awg есть, fwmark -> table $RT_TABLE_ID применён."
+log "Готово. Список: $IP_COUNT IP. Зона awg, forwarding, nft-set, fwmark -> table $RT_TABLE_ID настроены."
+log "Маршрут в table $RT_TABLE_ID: $(ip route show table $RT_TABLE_ID 2>/dev/null | head -1)"
 log "Проверка: sh /usr/bin/check_vpn.sh"
