@@ -1,5 +1,5 @@
 #!/bin/sh
-# check_vpn.sh — диагностика policy routing для AmneziaWG
+# check_vpn.sh — диагностика AmneziaWG: полный туннель + policy routing
 # Использование: sh /usr/bin/check_vpn.sh
 
 RT_TABLE_ID="100"
@@ -12,13 +12,12 @@ ok=0; fail=0; warn=0
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
-
 pass() { green "[OK]   $*"; ok=$((ok+1)); }
 err()  { red   "[FAIL] $*"; fail=$((fail+1)); }
 warn_() { yellow "[WARN] $*"; warn=$((warn+1)); }
 
 echo "=========================================="
-echo " Диагностика AmneziaWG policy routing"
+echo " Диагностика AmneziaWG"
 echo "=========================================="
 
 # ---------- 1. Окружение ----------
@@ -27,119 +26,170 @@ echo "--- 1. Окружение ---"
 command -v nft >/dev/null 2>&1 && pass "nft найден" || err "nft не найден"
 command -v uci >/dev/null 2>&1 && pass "uci найден" || err "uci не найден"
 [ -f /etc/iproute2/rt_tables ] && pass "/etc/iproute2/rt_tables есть" || err "нет /etc/iproute2/rt_tables"
-grep -q "$RT_TABLE_ID $RT_TABLE_NAME" /etc/iproute2/rt_tables 2>/dev/null \
-    && pass "таблица $RT_TABLE_ID зарегистрирована как $RT_TABLE_NAME" \
+grep -q "$RT_TABLE_ID " /etc/iproute2/rt_tables 2>/dev/null \
+    && pass "таблица $RT_TABLE_ID зарегистрирована" \
     || warn_ "таблица $RT_TABLE_ID не зарегистрирована в rt_tables"
 
-# ---------- 2. Интерфейс awg ----------
+# ---------- 2. UCI awg ----------
 echo
-echo "--- 2. Интерфейс awg ---"
+echo "--- 2. UCI network.awg ---"
+if uci -q get network.awg >/dev/null 2>&1; then
+    pass "network.awg настроен"
+    [ "$(uci -q get network.awg.proto)" = "amneziawg" ] && pass "  proto=amneziawg" || err "  proto=$(uci -q get network.awg.proto)"
+    [ "$(uci -q get network.awg.auto)" = "1" ] && pass "  auto=1" || warn_ "  auto=$(uci -q get network.awg.auto) (ожидалось 1)"
+else
+    err "network.awg отсутствует"
+fi
+
+# ---------- 3. Интерфейс awg ----------
+echo
+echo "--- 3. Интерфейс awg ---"
 if ip link show awg >/dev/null 2>&1; then
     pass "интерфейс awg существует"
-    ip -4 addr show awg | grep -q 'inet ' && pass "awg имеет IPv4-адрес" || warn_ "awg без IPv4"
+    ip -4 addr show awg | grep -q 'inet ' && pass "  awg имеет IPv4" || warn_ "  awg без IPv4"
     state=$(ip link show awg | awk '/state/ {print $9}')
-    [ "$state" = "UNKNOWN" ] || [ "$state" = "UP" ] && pass "awg state=$state" || warn_ "awg state=$state"
+    [ "$state" = "UNKNOWN" ] || [ "$state" = "UP" ] && pass "  state=$state" || warn_ "  state=$state"
 else
-    err "интерфейс awg не существует"
+    err "интерфейс awg не существует (ifup awg)"
+fi
+if command -v awg >/dev/null 2>&1; then
+    handshake=$(awg show 2>/dev/null | awk '/latest handshake/ {print $0}')
+    if [ -n "$handshake" ]; then
+        pass "awg handshake: $handshake"
+    else
+        warn_ "awg: нет handshake (проверьте параметры обфускации/время)"
+    fi
+    rx=$(awg show 2>/dev/null | awk '/transfer/ {print $3, $4}')
+    [ -n "$rx" ] && pass "awg transfer: $rx" || warn_ "awg: transfer пуст"
 fi
 
-if uci -q get network.awg >/dev/null 2>&1; then
-    pass "uci network.awg настроен"
-    rai=$(uci -q get network.@wireguard_awg[0].route_allowed_ips 2>/dev/null)
-    [ "$rai" = "1" ] && pass "route_allowed_ips=1" || warn_ "route_allowed_ips='$rai' (ожидалось 1)"
-else
-    err "uci network.awg отсутствует"
-fi
-
-# ---------- 3. Правило fwmark ----------
+# ---------- 4. Зона firewall ----------
 echo
-echo "--- 3. Правило fwmark -> table $RT_TABLE_ID ---"
+echo "--- 4. Зона firewall awg ---"
+idx=$(uci show firewall 2>/dev/null | grep -oE "@zone\[[0-9]+\]\.name='awg'" | grep -oE '[0-9]+' | head -1)
+if [ -n "$idx" ]; then
+    pass "зона awg существует (index $idx)"
+    uci show firewall.@zone[$idx] 2>/dev/null | grep -q "list network 'awg'" \
+        && pass "  zone.network содержит awg" \
+        || err "  zone.network НЕ содержит awg (добавьте: uci add_list firewall.@zone[$idx].network='awg')"
+    [ "$(uci -q get firewall.@zone[$idx].masq)" = "1" ] && pass "  masq=1" || warn_ "  masq=$(uci -q get firewall.@zone[$idx].masq)"
+    [ "$(uci -q get firewall.@zone[$idx].mtu_fix)" = "1" ] && pass "  mtu_fix=1" || warn_ "  mtu_fix=$(uci -q get firewall.@zone[$idx].mtu_fix)"
+    [ "$(uci -q get firewall.@zone[$idx].forward)" = "ACCEPT" ] && pass "  forward=ACCEPT" || warn_ "  forward=$(uci -q get firewall.@zone[$idx].forward)"
+else
+    err "зона awg не найдена"
+fi
+
+# ---------- 5. Forwarding ----------
+echo
+echo "--- 5. Forwarding lan -> awg ---"
+cnt=$(uci show firewall 2>/dev/null | grep -c "forwarding\[[0-9]\+\]\.dest='awg'")
+if [ "$cnt" -eq 0 ]; then
+    err "forwarding lan -> awg отсутствует"
+elif [ "$cnt" -eq 1 ]; then
+    pass "forwarding lan -> awg есть (1 шт.)"
+else
+    warn_ "forwarding lan -> awg: $cnt шт. (дубли, удалите лишние)"
+fi
+# Проверяем, что fw4 сгенерировал accept_to_awg
+if nft list chain inet fw4 forward_lan 2>/dev/null | grep -q 'accept_to_awg\|oifname "awg" accept'; then
+    pass "fw4 сгенерировал accept_to_awg в forward_lan"
+else
+    err "fw4 НЕ сгенерировал accept_to_awg (проверьте zone.network=awg и forwarding)"
+fi
+
+# ---------- 6. Правило fwmark ----------
+echo
+echo "--- 6. Правило fwmark -> table $RT_TABLE_ID ---"
 if uci -q get network.awg_rule >/dev/null 2>&1; then
     pass "uci network.awg_rule существует"
 else
-    err "uci network.awg_rule отсутствует"
+    warn_ "uci network.awg_rule отсутствует (для выборочной маршрутизации)"
 fi
 if ip rule show | grep -q "fwmark $FWMARK lookup $RT_TABLE_ID"; then
     pass "ip rule: fwmark $FWMARK -> table $RT_TABLE_ID"
 else
-    err "ip rule: fwmark $FWMARK -> table $RT_TABLE_ID не найдено"
+    warn_ "ip rule: fwmark $FWMARK -> table $RT_TABLE_ID не найдено"
 fi
 
-# ---------- 4. Маршрут в таблице 100 ----------
+# ---------- 7. Маршруты ----------
 echo
-echo "--- 4. Маршрут в таблице $RT_TABLE_ID ---"
-if ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
-    pass "default в table $RT_TABLE_ID есть:"
-    ip route show table "$RT_TABLE_ID" | sed 's/^/       /'
+echo "--- 7. Маршруты ---"
+if ip route show default 2>/dev/null | grep -q 'dev awg'; then
+    pass "default (main) -> awg"
 else
-    err "default в table $RT_TABLE_ID отсутствует"
+    warn_ "default (main) не через awg (route_allowed_ips?)"
+    ip route show default 2>/dev/null | sed 's/^/       /'
+fi
+if ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
+    pass "default в table $RT_TABLE_ID есть"
+else
+    warn_ "default в table $RT_TABLE_ID отсутствует (создаст скрипт при ifup awg)"
 fi
 
-# ---------- 5. nft-набор ----------
+# ---------- 8. nftables ----------
 echo
-echo "--- 5. nftables ---"
+echo "--- 8. nftables ---"
 if nft list set inet fw4 vpn_domains >/dev/null 2>&1; then
     pass "nft set inet fw4 vpn_domains существует"
     cnt=$(nft list set inet fw4 vpn_domains 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
-    [ "$cnt" -gt 0 ] && pass "  элементов в set: $cnt" || err "  set пуст"
+    [ "$cnt" -gt 0 ] && pass "  элементов: $cnt" || err "  set пуст"
 else
-    err "nft set inet fw4 vpn_domains не найден"
+    warn_ "nft set inet fw4 vpn_domains не найден"
 fi
 if nft list chain inet fw4 mangle_prerouting_awg >/dev/null 2>&1; then
     pass "nft chain mangle_prerouting_awg существует"
 else
-    err "nft chain mangle_prerouting_awg не найден"
+    warn_ "nft chain mangle_prerouting_awg не найден"
 fi
 if uci -q get firewall.$NFT_INCLUDE_NAME >/dev/null 2>&1; then
-    pass "uci firewall.$NFT_INCLUDE_NAME (include) настроен"
+    pass "uci firewall.$NFT_INCLUDE_NAME настроен"
     path=$(uci -q get firewall.$NFT_INCLUDE_NAME.path)
-    [ "$path" = "$NFT_FILE" ] && pass "  path=$NFT_FILE" || warn_ "  path=$path (ожидалось $NFT_FILE)"
+    [ "$path" = "$NFT_FILE" ] && pass "  path=$NFT_FILE" || warn_ "  path=$path"
 else
-    err "uci firewall.$NFT_INCLUDE_NAME отсутствует"
+    warn_ "uci firewall.$NFT_INCLUDE_NAME отсутствует"
 fi
 
-# ---------- 6. Проверка маркировки ----------
+# ---------- 9. Проверка маркировки ----------
 echo
-echo "--- 6. Маркировка и маршрут для тестового IP ---"
+echo "--- 9. Маркировка тестового IP ---"
 TEST_IP="142.250.74.46"
 if ip route get "$TEST_IP" mark "$FWMARK" 2>/dev/null | grep -q 'dev awg'; then
     pass "ip route get $TEST_IP mark $FWMARK -> dev awg"
 else
-    err "ip route get $TEST_IP mark $FWMARK не идёт через awg"
+    warn_ "ip route get $TEST_IP mark $FWMARK не через awg"
     ip route get "$TEST_IP" mark "$FWMARK" 2>/dev/null | sed 's/^/       /'
 fi
 
-# ---------- 7. Update-скрипт и cron ----------
+# ---------- 10. Update-скрипт и cron ----------
 echo
-echo "--- 7. Update-скрипт и cron ---"
-[ -x "$UPDATE_SCRIPT" ] && pass "$UPDATE_SCRIPT исполняемый" || err "$UPDATE_SCRIPT отсутствует или не исполняемый"
+echo "--- 10. Update-скрипт и cron ---"
+[ -x "$UPDATE_SCRIPT" ] && pass "$UPDATE_SCRIPT исполняемый" || err "$UPDATE_SCRIPT отсутствует"
 if [ -f /etc/crontabs/root ] && grep -q "$UPDATE_SCRIPT" /etc/crontabs/root; then
-    pass "cron содержит $UPDATE_SCRIPT:"
+    pass "cron содержит $UPDATE_SCRIPT"
     grep "$UPDATE_SCRIPT" /etc/crontabs/root | sed 's/^/       /'
 else
     err "cron не содержит $UPDATE_SCRIPT"
 fi
-pgrep -f "crond" >/dev/null 2>&1 && pass "crond запущен" || warn_ "crond не запущен"
+pgrep -f crond >/dev/null 2>&1 && pass "crond запущен" || warn_ "crond не запущен"
 
-# ---------- 8. dnsmasq ----------
+# ---------- 11. DNS ----------
 echo
-echo "--- 8. dnsmasq ---"
+echo "--- 11. dnsmasq ---"
 if timeout 5 nslookup google.com >/dev/null 2>&1; then
-    pass "dnsmasq отвечает на google.com"
+    pass "dnsmasq отвечает"
     ip=$(timeout 5 nslookup google.com 2>/dev/null | awk '/^Address [0-9]+: / {print $3}' | head -1)
-    [ -n "$ip" ] && pass "  google.com -> $ip" || warn_ "  не удалось извлечь IP"
+    [ -n "$ip" ] && pass "  google.com -> $ip"
 else
-    err "dnsmasq не отвечает на google.com"
+    err "dnsmasq не отвечает"
 fi
 
-# ---------- 9. Счётчики awg ----------
+# ---------- 12. IPv6 на LAN ----------
 echo
-echo "--- 9. Счётчики awg ---"
-if ip link show awg >/dev/null 2>&1; then
-    rx=$(ip -s link show awg 2>/dev/null | awk '/RX:/ {getline; print $2}')
-    tx=$(ip -s link show awg 2>/dev/null | awk '/TX:/ {getline; print $2}')
-    [ "${rx:-0}" -gt 0 ] 2>/dev/null && pass "RX=$rx байт" || warn_ "RX=$rx (нет входящего трафика)"
-    [ "${tx:-0}" -gt 0 ] 2>/dev/null && pass "TX=$tx байт" || warn_ "TX=$tx (нет исходящего трафика)"
+echo "--- 12. IPv6 на LAN ---"
+if [ -z "$(uci -q get network.lan.ip6assign)" ] && [ "$(uci -q get network.lan.delegate)" = "0" ]; then
+    pass "IPv6 на LAN отключён (ip6assign='', delegate=0)"
+else
+    warn_ "IPv6 на LAN может быть активен (ip6assign=$(uci -q get network.lan.ip6assign), delegate=$(uci -q get network.lan.delegate))"
 fi
 
 # ---------- Итог ----------

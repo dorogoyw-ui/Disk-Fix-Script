@@ -1,6 +1,7 @@
 #!/bin/sh
-# setup_vpn.sh — AmneziaWG policy routing + domain/IP list updater
-# Предполагается: интерфейс awg уже настроен и поднят, "Route Allowed IPs" включён.
+# setup_vpn.sh — AmneziaWG: полный туннель + выборочная маршрутизация (таблица 100)
+# Предполагается: интерфейс awg уже настроен в UCI (proto amneziawg, пир, ключи).
+# Скрипт НЕ пересоздаёт awg, а донастраивает firewall, зону, forwarding, nft-set, cron.
 
 set -e
 
@@ -18,6 +19,7 @@ FWMARK="0x1"
 DNS_TIMEOUT="5"
 NFT_FILE="/etc/nftables.d/99-awg-domains.nft"
 NFT_INCLUDE_NAME="awg_domains"
+AWG_ZONE_NAME="awg"
 
 TMP_RAW="/tmp/awg_list.raw"
 TMP_IPS="/tmp/awg_ips.tmp"
@@ -27,9 +29,11 @@ TMP_NFT="/tmp/99-awg-domains.nft"
 log() { logger -t awg-setup "$*"; echo "$*"; }
 die() { log "ОШИБКА: $*"; rollback; exit 1; }
 
+# Откат: удаляем ТОЛЬКО то, что создал скрипт (правило, include, nft-файл, маршрут в table 100).
+# Зону awg, forwarding lan->awg, auto='1' НЕ трогаем — они могли быть настроены до скрипта.
 rollback() {
-    log "Откат изменений..."
-    uci -q delete network.awg_rule  2>/dev/null || true
+    log "Откат изменений, внесённых скриптом..."
+    uci -q delete network.awg_rule 2>/dev/null || true
     uci -q delete firewall.$NFT_INCLUDE_NAME 2>/dev/null || true
     uci commit network 2>/dev/null || true
     uci commit firewall 2>/dev/null || true
@@ -39,7 +43,7 @@ rollback() {
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
-# Резолв через системный dnsmasq (127.0.0.1:53) с таймаутом 5 сек.
+# Резолв через системный dnsmasq (127.0.0.1:53). Без второго аргумента (1.1.1.1 игнорируется musl).
 resolve_host() {
     host="$1"
     if command -v timeout >/dev/null 2>&1; then
@@ -73,7 +77,7 @@ fetch_list() {
     return 1
 }
 
-# Парсинг списка: $1 — входной файл, $2 — выходной файл с IP/CIDR
+# Парсинг: $1 — входной файл, $2 — выходной с IP/CIDR
 parse_list() {
     in="$1"; out="$2"
     ENTRIES=$(sed 's/\r//g; s/#.*//g; s/^[[:space:]]*//; s/[[:space:]]*$//' "$in" | grep -v '^$')
@@ -98,7 +102,7 @@ parse_list() {
     [ -s "$out" ]
 }
 
-# Генерация nft-конфига из списка IP. $1 — файл с IP, $2 — выходной nft
+# Генерация nft-конфига. $1 — файл с IP, $2 — выходной nft
 gen_nft() {
     ips_file="$1"; nft_file="$2"
     SORTED_IPS=$(tr '\n' ',' < "$ips_file" | sed 's/,$//')
@@ -118,14 +122,70 @@ chain mangle_prerouting_awg {
 NFT_EOF
 }
 
+# Найти индекс зоны awg в firewall (или создать)
+ensure_awg_zone() {
+    # Ищем зону с именем awg
+    idx=$(uci show firewall | grep -oE "@zone\[[0-9]+\]\.name='awg'" | grep -oE '[0-9]+' | head -1)
+    if [ -z "$idx" ]; then
+        # Создаём зону
+        uci add firewall zone >/dev/null
+        idx=$(( $(uci show firewall | grep -c '^firewall.@zone\[') - 1 ))
+        uci set firewall.@zone[$idx].name="$AWG_ZONE_NAME"
+        uci set firewall.@zone[$idx].input='REJECT'
+        uci set firewall.@zone[$idx].output='ACCEPT'
+        uci set firewall.@zone[$idx].forward='ACCEPT'
+        uci set firewall.@zone[$idx].masq='1'
+        uci set firewall.@zone[$idx].masq6='1'
+        uci set firewall.@zone[$idx].mtu_fix='1'
+        log "  создана зона $AWG_ZONE_NAME (index $idx)"
+    else
+        log "  зона $AWG_ZONE_NAME уже существует (index $idx)"
+    fi
+    # Привязываем интерфейс awg к зоне, если ещё не привязан
+    if ! uci show firewall.@zone[$idx] 2>/dev/null | grep -q "list network 'awg'"; then
+        uci add_list firewall.@zone[$idx].network='awg'
+        log "  зона $AWG_ZONE_NAME привязана к интерфейсу awg"
+    fi
+    # Убеждаемся, что masq/mtu_fix/forward включены
+    uci set firewall.@zone[$idx].masq='1'
+    uci set firewall.@zone[$idx].mtu_fix='1'
+    uci set firewall.@zone[$idx].forward='ACCEPT'
+    echo "$idx"
+}
+
+# Убедиться, что forwarding lan -> awg существует и он один
+ensure_forwarding() {
+    # Удаляем все дубли forwarding lan->awg, оставляем один
+    count=$(uci show firewall | grep -c "forwarding\[[0-9]\+\]\.dest='awg'")
+    if [ "$count" -eq 0 ]; then
+        uci add firewall forwarding >/dev/null
+        uci set firewall.@forwarding[-1].src='lan'
+        uci set firewall.@forwarding[-1].dest="$AWG_ZONE_NAME"
+        log "  добавлен forwarding lan -> $AWG_ZONE_NAME"
+    elif [ "$count" -gt 1 ]; then
+        # Удаляем все, кроме первого
+        first=1
+        for i in $(uci show firewall | grep -oE "forwarding\[[0-9]+\]\.dest='awg'" | grep -oE '[0-9]+'); do
+            if [ "$first" = "1" ]; then
+                first=0
+                continue
+            fi
+            uci delete firewall.@forwarding[$i]
+            log "  удалён дубль forwarding[$i]"
+        done
+    else
+        log "  forwarding lan -> $AWG_ZONE_NAME уже есть (1 шт.)"
+    fi
+}
+
 # ==================== 1. ПРОВЕРКА ====================
 log "1. Проверка окружения..."
 [ -f /etc/iproute2/rt_tables ] || die "/etc/iproute2/rt_tables не найден"
 command -v nft >/dev/null 2>&1 || die "nft не найден (нужен fw4/nftables)"
 command -v uci >/dev/null 2>&1 || die "uci не найден"
-uci -q get network.awg >/dev/null 2>&1 || log "ВНИМАНИЕ: интерфейс 'awg' не найден в UCI"
+uci -q get network.awg >/dev/null 2>&1 || die "network.awg не настроен — сначала настройте AmneziaWG в LuCI"
 
-# Проверка dnsmasq
+# dnsmasq
 if ! timeout "$DNS_TIMEOUT" nslookup google.com >/dev/null 2>&1; then
     log "ВНИМАНИЕ: dnsmasq не отвечает — перезапускаю..."
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
@@ -148,42 +208,57 @@ log "4. Генерация nft-конфига..."
 gen_nft "$TMP_IPS" "$TMP_NFT" || die "не удалось сгенерировать nft-конфиг"
 cp "$TMP_NFT" "$NFT_FILE"
 
-# ==================== 5. UCI: правило + include ====================
+# ==================== 5. UCI ====================
 log "5. Применение uci-настроек..."
 
-# 5a. Таблица rt_tables
+# 5a. rt_tables
 grep -q "$RT_TABLE_ID $RT_TABLE_NAME" /etc/iproute2/rt_tables \
     || echo "$RT_TABLE_ID $RT_TABLE_NAME" >> /etc/iproute2/rt_tables
 
-# 5b. Правило fwmark -> table 100 (awg_route НЕ создаём — он уже есть от Route Allowed IPs)
+# 5b. auto='1' для awg
+if [ "$(uci -q get network.awg.auto)" != "1" ]; then
+    uci set network.awg.auto='1'
+    log "  network.awg.auto=1"
+fi
+
+# 5c. Зона awg + привязка network='awg'
+ZONE_IDX=$(ensure_awg_zone)
+log "  зона awg: index $ZONE_IDX"
+
+# 5d. Forwarding lan -> awg (ровно один)
+ensure_forwarding
+
+# 5e. Правило fwmark -> table 100
 uci -q delete network.awg_rule
 uci set network.awg_rule=rule
 uci set network.awg_rule.mark="$FWMARK"
 uci set network.awg_rule.lookup="$RT_TABLE_ID"
-uci commit network
 
-# 5c. Include nft-файла в fw4
+# 5f. Include nft-файла в fw4
 uci -q delete firewall.$NFT_INCLUDE_NAME
 uci set firewall.$NFT_INCLUDE_NAME=include
 uci set firewall.$NFT_INCLUDE_NAME.type='nftables'
 uci set firewall.$NFT_INCLUDE_NAME.path="$NFT_FILE"
 uci set firewall.$NFT_INCLUDE_NAME.position='table-append'
+
+uci commit network
 uci commit firewall
 
-# 5d. Применение
+# 5g. Применение
 /etc/init.d/firewall restart >/dev/null 2>&1 || log "ВНИМАНИЕ: firewall restart вернул ошибку"
 /etc/init.d/network reload   >/dev/null 2>&1 || log "ВНИМАНИЕ: network reload вернул ошибку"
 
-# 5e. Гарантия маршрута в таблице 100
+# 5h. Гарантия маршрута в таблице 100 (только если awg поднят)
 sleep 1
-if ! ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
-    log "  маршрут в таблице $RT_TABLE_ID отсутствует — создаю вручную"
-    ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null \
-        || log "  ВНИМАНИЕ: не удалось создать маршрут (awg не поднят?)"
-    # прописываем в rc.local, чтобы восстанавливалось после перезагрузки
-    if ! grep -q "ip route replace default dev awg table $RT_TABLE_ID" /etc/rc.local 2>/dev/null; then
-        sed -i "/^exit 0/i ip route replace default dev awg table $RT_TABLE_ID" /etc/rc.local 2>/dev/null || true
+if ip link show awg >/dev/null 2>&1; then
+    if ! ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
+        log "  маршрут в таблице $RT_TABLE_ID отсутствует — создаю вручную"
+        ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null \
+            || log "  ВНИМАНИЕ: не удалось создать маршрут"
     fi
+else
+    log "  ВНИМАНИЕ: интерфейс awg не поднят — маршрут в таблице $RT_TABLE_ID не создан"
+    log "  выполните: ifup awg && sh $0"
 fi
 
 # ==================== 6. UPDATE-СКРИПТ ====================
@@ -289,5 +364,5 @@ echo "0 4 * * * $UPDATE_SCRIPT" >> /etc/crontabs/root
 /etc/init.d/cron enable
 /etc/init.d/cron restart
 
-log "Готово. Список загружен ($IP_COUNT IP), правило fwmark применено."
+log "Готово. Список загружен ($IP_COUNT IP), зона awg настроена, forwarding lan->awg есть, fwmark -> table $RT_TABLE_ID применён."
 log "Проверка: sh /usr/bin/check_vpn.sh"
