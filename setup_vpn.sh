@@ -36,27 +36,18 @@ rollback() {
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
-# Резолв с гарантированным таймаутом. Возвращает список IPv4 по одному в строке.
+# Резолв через системный dnsmasq (127.0.0.1:53) с таймаутом 5 сек.
+# ВАЖНО: не передаём второй аргумент (внешний DNS) — в musl nslookup он игнорируется и может зависнуть.
 resolve_host() {
     host="$1"
-    if command -v getent >/dev/null 2>&1; then
-        getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u
-        return 0
-    fi
     if command -v timeout >/dev/null 2>&1; then
         timeout "$DNS_TIMEOUT" nslookup "$host" 2>/dev/null \
             | awk '/^Address [0-9]+: / {print $3}' \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
     else
-        nslookup "$host" 2>/dev/null > /tmp/.nsout &
-        pid=$!
-        ( sleep "$DNS_TIMEOUT"; kill -9 "$pid" 2>/dev/null ) &
-        killer=$!
-        wait "$pid" 2>/dev/null || true
-        kill "$killer" 2>/dev/null || true
-        awk '/^Address [0-9]+: / {print $3}' /tmp/.nsout 2>/dev/null \
+        nslookup "$host" 2>/dev/null \
+            | awk '/^Address [0-9]+: / {print $3}' \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
-        rm -f /tmp/.nsout
     fi
 }
 
@@ -94,18 +85,14 @@ parse_list() {
         if echo "$entry" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
             echo "$entry" >> "$out"
         else
-            # Сам домен
             resolve_host "$entry" >> "$out" 2>/dev/null || true
-            # www. только для корневых доменов (без поддоменов)
             case "$entry" in
                 www.*|*.*.*) ;;
-                *)
-                    resolve_host "www.$entry" >> "$out" 2>/dev/null || true
-                    ;;
+                *) resolve_host "www.$entry" >> "$out" 2>/dev/null || true ;;
             esac
         fi
     done
-    sort -u "$out" -o "$out" 2>/dev/null || sort -u "$out" > "$out.tmp" && mv "$out.tmp" "$out"
+    sort -u "$out" -o "$out" 2>/dev/null || { sort -u "$out" > "$out.tmp" && mv "$out.tmp" "$out"; }
     [ -s "$out" ]
 }
 
@@ -136,6 +123,13 @@ command -v nft >/dev/null 2>&1 || die "nft не найден (нужен fw4/nft
 command -v uci >/dev/null 2>&1 || die "uci не найден"
 if ! uci -q get network.awg >/dev/null 2>&1; then
     log "ВНИМАНИЕ: интерфейс 'awg' не найден в UCI — маршрут в таблицу $RT_TABLE_ID может не работать"
+fi
+
+# Быстрая проверка резолвера
+if ! timeout "$DNS_TIMEOUT" nslookup google.com >/dev/null 2>&1; then
+    log "ВНИМАНИЕ: dnsmasq не отвечает на google.com — пробую перезапустить..."
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    sleep 2
 fi
 
 # ==================== 2. СКАЧИВАНИЕ ====================
@@ -192,24 +186,14 @@ log() { logger -t awg-updater "$*"; }
 
 resolve_host() {
     host="$1"
-    if command -v getent >/dev/null 2>&1; then
-        getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u
-        return 0
-    fi
     if command -v timeout >/dev/null 2>&1; then
         timeout "$DNS_TIMEOUT" nslookup "$host" 2>/dev/null \
             | awk '/^Address [0-9]+: / {print $3}' \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
     else
-        nslookup "$host" 2>/dev/null > /tmp/.nsout &
-        pid=$!
-        ( sleep "$DNS_TIMEOUT"; kill -9 "$pid" 2>/dev/null ) &
-        killer=$!
-        wait "$pid" 2>/dev/null || true
-        kill "$killer" 2>/dev/null || true
-        awk '/^Address [0-9]+: / {print $3}' /tmp/.nsout 2>/dev/null \
+        nslookup "$host" 2>/dev/null \
+            | awk '/^Address [0-9]+: / {print $3}' \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
-        rm -f /tmp/.nsout
     fi
 }
 
@@ -244,7 +228,7 @@ echo "$ENTRIES" | while IFS= read -r entry; do
     fi
 done
 
-sort -u "$TMP_IPS" -o "$TMP_IPS" 2>/dev/null || sort -u "$TMP_IPS" > "$TMP_IPS.tmp" && mv "$TMP_IPS.tmp" "$TMP_IPS"
+sort -u "$TMP_IPS" -o "$TMP_IPS" 2>/dev/null || { sort -u "$TMP_IPS" > "$TMP_IPS.tmp" && mv "$TMP_IPS.tmp" "$TMP_IPS"; }
 SORTED_IPS=$(tr '\n' ',' < "$TMP_IPS" | sed 's/,$//')
 [ -n "$SORTED_IPS" ] || { log "no ips"; exit 1; }
 
