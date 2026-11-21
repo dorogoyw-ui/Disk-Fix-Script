@@ -28,6 +28,7 @@ AWG_ZONE_NAME="awg"
 TMP_RAW="/tmp/awg_list.raw"
 TMP_IPS="/tmp/awg_ips.tmp"
 TMP_NFT="/tmp/99-awg-domains.nft"
+TMP_FAILED="/tmp/awg_dns_failed.tmp"
 
 ORIGINAL_ROUTE_ALLOWED_IPS="$(uci -q get network.@amneziawg_awg[0].route_allowed_ips 2>/dev/null || true)"
 
@@ -84,18 +85,31 @@ ensure_wan_default() {
     fi
 }
 
+# Разбор BusyBox nslookup.
+# Не берём адрес DNS-сервера, только адреса после Name:.
 resolve_host() {
     host="$1"
 
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$DNS_TIMEOUT" nslookup "$host" 2>/dev/null |
-            awk '/^Address [0-9]+: / {print $3}' |
-            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+        timeout "$DNS_TIMEOUT" nslookup "$host" 2>/dev/null
     else
-        nslookup "$host" 2>/dev/null |
-            awk '/^Address [0-9]+: / {print $3}' |
-            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
-    fi
+        nslookup "$host" 2>/dev/null
+    fi |
+    awk '
+        /^Name:/ {
+            in_answer=1
+            next
+        }
+
+        in_answer && /^Address/ {
+            ip=$NF
+            sub(/#.*/, "", ip)
+
+            if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                print ip
+            }
+        }
+    '
 }
 
 fetch_list() {
@@ -125,36 +139,53 @@ fetch_list() {
 parse_list() {
     in="$1"
     out="$2"
+    failed="$3"
 
-    ENTRIES=$(sed 's/\r//g; s/#.*//g; s/^[[:space:]]*//; s/[[:space:]]*$//' "$in" | grep -v '^$')
+    ENTRIES="$(sed 's/\r//g; s/#.*//g; s/^[[:space:]]*//; s/[[:space:]]*$//' "$in" | grep -v '^$' || true)"
 
     [ -n "$ENTRIES" ] || return 1
 
-    > "$out"
+    : > "$out"
+    : > "$failed"
 
-    COUNT=0
-
-    echo "$ENTRIES" | while IFS= read -r entry; do
+    printf '%s\n' "$ENTRIES" | while IFS= read -r entry; do
         [ -z "$entry" ] && continue
 
-        COUNT=$((COUNT+1))
-
-        [ $((COUNT % 10)) -eq 0 ] && log "Обработано $COUNT записей..."
-
+        # Статические IP и CIDR
         if echo "$entry" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
             echo "$entry" >> "$out"
-        else
-            resolve_host "$entry" >> "$out" 2>/dev/null || true
-
-            case "$entry" in
-                www.*|*.*.*) ;;
-                *) resolve_host "www.$entry" >> "$out" 2>/dev/null || true ;;
-            esac
+            continue
         fi
+
+        host_tmp="/tmp/awg_resolve_$$.tmp"
+        : > "$host_tmp"
+
+        # Основной домен
+        resolve_host "$entry" >> "$host_tmp" 2>/dev/null || true
+
+        # Дополнительно проверяем www, если это не www-домен
+        case "$entry" in
+            www.*)
+                ;;
+            *)
+                resolve_host "www.$entry" >> "$host_tmp" 2>/dev/null || true
+                ;;
+        esac
+
+        if [ -s "$host_tmp" ]; then
+            cat "$host_tmp" >> "$out"
+        else
+            echo "$entry" >> "$failed"
+        fi
+
+        rm -f "$host_tmp"
     done
 
     sort -u "$out" -o "$out" 2>/dev/null ||
         { sort -u "$out" > "$out.tmp" && mv "$out.tmp" "$out"; }
+
+    sort -u "$failed" -o "$failed" 2>/dev/null ||
+        { sort -u "$failed" > "$failed.tmp" && mv "$failed.tmp" "$failed"; }
 
     [ -s "$out" ]
 }
@@ -163,7 +194,7 @@ gen_nft() {
     ips_file="$1"
     nft_file="$2"
 
-    SORTED_IPS=$(tr '\n' ',' < "$ips_file" | sed 's/,$//')
+    SORTED_IPS="$(tr '\n' ',' < "$ips_file" | sed 's/,$//')"
 
     [ -n "$SORTED_IPS" ] || return 1
 
@@ -277,7 +308,7 @@ wait_handshake() {
 
 log "0. Скачивание списка..."
 
-rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
+rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT" "$TMP_FAILED"
 
 fetch_list "$TMP_RAW" || die "Не удалось скачать список"
 
@@ -289,6 +320,7 @@ log "1. Проверка окружения..."
 command -v nft >/dev/null 2>&1 || die "Нет nft"
 command -v uci >/dev/null 2>&1 || die "Нет uci"
 command -v awg >/dev/null 2>&1 || die "Нет awg"
+command -v nslookup >/dev/null 2>&1 || die "Нет nslookup"
 
 uci -q get network.awg >/dev/null 2>&1 ||
     die "network.awg не настроен"
@@ -318,12 +350,20 @@ fi
 
 log "3. Парсинг списка..."
 
-parse_list "$TMP_RAW" "$TMP_IPS" ||
+parse_list "$TMP_RAW" "$TMP_IPS" "$TMP_FAILED" ||
     die "Не удалось получить IP"
 
-IP_COUNT=$(wc -l < "$TMP_IPS")
+IP_COUNT="$(wc -l < "$TMP_IPS" | tr -d ' ')"
+FAILED_COUNT="$(wc -l < "$TMP_FAILED" | tr -d ' ')"
 
 log "Получено IP/CIDR: $IP_COUNT"
+log "Доменов без DNS-ответа: $FAILED_COUNT"
+
+if [ -s "$TMP_FAILED" ]; then
+    while IFS= read -r failed_domain; do
+        [ -n "$failed_domain" ] && log "DNS ERROR: $failed_domain"
+    done < "$TMP_FAILED"
+fi
 
 # ==================== 4. NFT ====================
 
@@ -345,7 +385,7 @@ grep -q "$RT_TABLE_ID $RT_TABLE_NAME" /etc/iproute2/rt_tables ||
 
 uci set network.awg.auto='1'
 
-ZONE_IDX=$(ensure_awg_zone)
+ZONE_IDX="$(ensure_awg_zone)"
 
 log "Зона awg: index $ZONE_IDX"
 
@@ -497,10 +537,13 @@ cat > "$UPDATE_SCRIPT" << 'UPD_EOF'
 LIST_URL="__LIST_URL__"
 LIST_MIRRORS="__MIRRORS__"
 DNS_TIMEOUT="__DNS_TIMEOUT__"
+FWMARK="0x1"
 
 TMP_RAW="/tmp/awg_list.raw"
 TMP_IPS="/tmp/awg_ips.tmp"
 TMP_NFT="/tmp/99-awg-domains.nft"
+TMP_FAILED="/tmp/awg_dns_failed.tmp"
+TMP_HOST="/tmp/awg_resolve.tmp"
 FINAL_NFT="/etc/nftables.d/99-awg-domains.nft"
 
 log() {
@@ -511,17 +554,36 @@ resolve_host() {
     host="$1"
 
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$DNS_TIMEOUT" nslookup "$host" 2>/dev/null |
-            awk '/^Address [0-9]+: / {print $3}' |
-            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+        timeout "$DNS_TIMEOUT" nslookup "$host" 2>/dev/null
     else
-        nslookup "$host" 2>/dev/null |
-            awk '/^Address [0-9]+: / {print $3}' |
-            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
-    fi
+        nslookup "$host" 2>/dev/null
+    fi |
+    awk '
+        /^Name:/ {
+            in_answer=1
+            next
+        }
+
+        in_answer && /^Address/ {
+            ip=$NF
+            sub(/#.*/, "", ip)
+
+            if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                print ip
+            }
+        }
+    '
 }
 
-rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
+cleanup() {
+    rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT" "$TMP_FAILED" "$TMP_HOST"
+}
+
+trap cleanup EXIT INT TERM
+
+rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT" "$TMP_FAILED" "$TMP_HOST"
+
+# ---------- Download ----------
 
 ok=0
 
@@ -540,41 +602,76 @@ for url in "$LIST_URL" $LIST_MIRRORS; do
 done
 
 [ "$ok" = "1" ] || {
-    log "Download failed"
+    log "ERROR: не удалось скачать список; действующий nft-набор сохранён"
     exit 1
 }
 
-ENTRIES=$(sed 's/\r//g; s/#.*//g; s/^[[:space:]]*//; s/[[:space:]]*$//' "$TMP_RAW" | grep -v '^$')
+# ---------- Parse and resolve ----------
+
+ENTRIES="$(sed 's/\r//g; s/#.*//g; s/^[[:space:]]*//; s/[[:space:]]*$//' "$TMP_RAW" | grep -v '^$' || true)"
 
 [ -n "$ENTRIES" ] || {
-    log "Empty list"
+    log "ERROR: получен пустой список; действующий nft-набор сохранён"
     exit 1
 }
 
-> "$TMP_IPS"
+: > "$TMP_IPS"
+: > "$TMP_FAILED"
 
-echo "$ENTRIES" | while IFS= read -r entry; do
+printf '%s\n' "$ENTRIES" | while IFS= read -r entry; do
     [ -z "$entry" ] && continue
 
     if echo "$entry" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
         echo "$entry" >> "$TMP_IPS"
-    else
-        resolve_host "$entry" >> "$TMP_IPS" 2>/dev/null || true
+        continue
+    fi
 
-        case "$entry" in
-            www.*|*.*.*) ;;
-            *) resolve_host "www.$entry" >> "$TMP_IPS" 2>/dev/null || true ;;
-        esac
+    : > "$TMP_HOST"
+
+    resolve_host "$entry" >> "$TMP_HOST" 2>/dev/null || true
+
+    case "$entry" in
+        www.*)
+            ;;
+        *)
+            resolve_host "www.$entry" >> "$TMP_HOST" 2>/dev/null || true
+            ;;
+    esac
+
+    if [ -s "$TMP_HOST" ]; then
+        cat "$TMP_HOST" >> "$TMP_IPS"
+    else
+        echo "$entry" >> "$TMP_FAILED"
     fi
 done
 
 sort -u "$TMP_IPS" -o "$TMP_IPS" 2>/dev/null ||
-    { sort -u "$TMP_IPS" > "$TMP_IPS.tmp" && mv "$TMP_IPS.tmp" "$TMP_IPS"; }
+    { sort -u "$TMP_IPS" > "$TMP_IPS.sorted" && mv "$TMP_IPS.sorted" "$TMP_IPS"; }
 
-SORTED_IPS=$(tr '\n' ',' < "$TMP_IPS" | sed 's/,$//')
+sort -u "$TMP_FAILED" -o "$TMP_FAILED" 2>/dev/null ||
+    { sort -u "$TMP_FAILED" > "$TMP_FAILED.sorted" && mv "$TMP_FAILED.sorted" "$TMP_FAILED"; }
+
+[ -s "$TMP_IPS" ] || {
+    log "ERROR: DNS не вернул ни одного IPv4; действующий nft-набор сохранён"
+    exit 1
+}
+
+FAILED_COUNT="$(wc -l < "$TMP_FAILED" | tr -d ' ')"
+
+if [ "$FAILED_COUNT" -gt 0 ]; then
+    log "DNS: доменов без IPv4: $FAILED_COUNT"
+
+    while IFS= read -r failed_domain; do
+        [ -n "$failed_domain" ] && log "DNS ERROR: $failed_domain"
+    done < "$TMP_FAILED"
+fi
+
+# ---------- Generate nft config ----------
+
+SORTED_IPS="$(tr '\n' ',' < "$TMP_IPS" | sed 's/,$//')"
 
 [ -n "$SORTED_IPS" ] || {
-    log "No IP addresses"
+    log "ERROR: пустой набор IP; действующий nft-набор сохранён"
     exit 1
 }
 
@@ -588,38 +685,103 @@ set vpn_domains {
 
 chain mangle_prerouting_awg {
     type filter hook prerouting priority mangle; policy accept;
-    iifname "br-lan" ip daddr @vpn_domains meta mark set 0x1
+    iifname "br-lan" ip daddr @vpn_domains meta mark set $FWMARK
 }
 NFT_EOF
+
+# ---------- Apply ----------
 
 if ! cmp -s "$TMP_NFT" "$FINAL_NFT"; then
 
     cp "$TMP_NFT" "$FINAL_NFT"
 
     if /etc/init.d/firewall restart >/dev/null 2>&1; then
-        log "Updated: $(wc -l < "$TMP_IPS") IP"
+        log "NFT обновлён: $(wc -l < "$TMP_IPS" | tr -d ' ') IP/CIDR"
     else
         log "ERROR: firewall restart failed"
         exit 1
     fi
 
 else
-    log "No changes"
+    # Если конфиг не изменился, но набор отсутствует в активном firewall,
+    # перезапускаем firewall для восстановления набора.
+    if ! nft list set inet fw4 vpn_domains >/dev/null 2>&1; then
+        log "Активный vpn_domains отсутствует — восстанавливаем firewall"
+
+        if ! /etc/init.d/firewall restart >/dev/null 2>&1; then
+            log "ERROR: firewall restart failed"
+            exit 1
+        fi
+    else
+        log "Список IP не изменился"
+    fi
 fi
 
-rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
+# ---------- Verify nft set and policy route ----------
+
+log "Начало проверки vpn_domains и маршрутизации"
+
+TOTAL=0
+NFT_OK=0
+ROUTE_OK=0
+NFT_FAIL=0
+ROUTE_FAIL=0
+CIDR_SKIPPED=0
+
+while IFS= read -r ip; do
+    [ -z "$ip" ] && continue
+
+    # Для CIDR проверка выполняется отдельно:
+    # route get требует конкретный IP.
+    case "$ip" in
+        */*)
+            CIDR_SKIPPED=$((CIDR_SKIPPED + 1))
+            continue
+            ;;
+    esac
+
+    TOTAL=$((TOTAL + 1))
+
+    if nft get element inet fw4 vpn_domains "{ $ip }" >/dev/null 2>&1; then
+        NFT_OK=$((NFT_OK + 1))
+    else
+        NFT_FAIL=$((NFT_FAIL + 1))
+        log "ERROR NFT: $ip отсутствует в vpn_domains"
+        continue
+    fi
+
+    route_result="$(ip -4 route get "$ip" mark "$FWMARK" 2>/dev/null || true)"
+
+    if echo "$route_result" | grep -q 'dev awg'; then
+        ROUTE_OK=$((ROUTE_OK + 1))
+    else
+        ROUTE_FAIL=$((ROUTE_FAIL + 1))
+        log "ERROR ROUTE: $ip не направляется через awg"
+    fi
+
+done < "$TMP_IPS"
+
+log "Проверка завершена"
+log "IPv4: $TOTAL"
+log "NFT OK: $NFT_OK"
+log "NFT ERROR: $NFT_FAIL"
+log "ROUTE OK: $ROUTE_OK"
+log "ROUTE ERROR: $ROUTE_FAIL"
+log "CIDR пропущено в индивидуальной проверке: $CIDR_SKIPPED"
 
 exit 0
 UPD_EOF
 
+# ---------- Substitute updater configuration ----------
+
 sed -i "s|__LIST_URL__|$LIST_URL|" "$UPDATE_SCRIPT"
 
-MIRRORS_ONELINE=$(echo "$LIST_MIRRORS" | tr '\n' ' ')
+MIRRORS_ONELINE="$(echo "$LIST_MIRRORS" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')"
 
 sed -i "s|__MIRRORS__|$MIRRORS_ONELINE|" "$UPDATE_SCRIPT"
 sed -i "s|__DNS_TIMEOUT__|$DNS_TIMEOUT|" "$UPDATE_SCRIPT"
 
-chmod +x "$UPDATE_SCRIPT"
+chmod 755 "$UPDATE_SCRIPT"
 
 # ==================== 9. CRON ====================
 
@@ -641,7 +803,8 @@ echo "@reboot sleep 35 && /usr/bin/ensure_awg_policy.sh >/dev/null 2>&1" >> /etc
 
 # ==================== DONE ====================
 
-log "Готово. Список: $IP_COUNT IP"
+log "Готово. Список: $IP_COUNT IP/CIDR"
+log "Доменов без DNS-ответа: $FAILED_COUNT"
 
 log "Маршрут:"
 ip -4 route show table "$RT_TABLE_ID" 2>/dev/null
