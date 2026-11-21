@@ -1,0 +1,138 @@
+# ==========================================
+# СТАТИЧЕСКИЕ ПОДСЕТИ (ДЛЯ CDN, ВИДЕО И ЗВОНКОВ)
+# ==========================================
+
+# YouTube и сервисы Google (видеопотоки googlevideo)
+142.250.0.0/15
+172.217.0.0/16
+216.58.192.0/19
+74.125.0.0/16
+
+# Instagram, Facebook и Threads (фото и видео Meta CDN)
+157.240.0.0/16
+31.13.24.0/21
+31.13.64.0/18
+185.60.216.0/22
+
+# Telegram (дата-центры, медиа и голосовые звонки)
+91.108.4.0/22
+91.108.8.0/22
+91.108.12.0/22
+91.108.16.0/22
+91.108.56.0/22
+149.154.160.0/20
+
+# ==========================================
+# ДОМЕННЫЕ ИМЕНА
+# ==========================================
+
+# YouTube и видеосервисы
+youtube.com
+youtu.be
+vimeo.com
+vimeocdn.com
+
+# Telegram
+telegram.org
+t.me
+telegra.ph
+tdesktop.com
+telegram.me
+
+# Instagram и Meta
+instagram.com
+facebook.com
+threads.net
+meta.com
+
+# X (Twitter)
+x.com
+twitter.com
+twimg.com
+t.co
+
+# Discord
+discord.com
+discordapp.com
+discordapp.net
+discord.gg
+discord.media
+
+# ИИ-сервисы (ChatGPT, Claude, Gemini, Midjourney, Perplexity, Hugging Face)
+openai.com
+chatgpt.com
+oaistatic.com
+oaiusercontent.com
+anthropic.com
+claude.ai
+gemini.google.com
+aistudio.google.com
+midjourney.com
+perplexity.ai
+huggingface.co
+hf.co
+civitai.com
+
+# Игровые платформы и мобильные игры
+steamcommunity.com
+epicgames.com
+unrealengine.com
+supercell.com
+brawlstars.com
+clashroyale.com
+clashofclans.com
+playstation.com
+sonyentertainmentnetwork.com
+xbox.com
+ea.com
+ubisoft.com
+riotgames.com
+leagueoflegends.com
+valorant.com
+roblox.com
+rbxcdn.com
+nexusmods.com
+
+# Разработка, облака и IT-инструменты
+docker.com
+docker.io
+jetbrains.com
+githubusercontent.com
+gitlab.com
+stackoverflow.com
+medium.com
+dev.to
+digitalocean.com
+cloudflare.com
+
+# Музыка, кино, соцсети и торренты
+spotify.com
+scdn.co
+netflix.com
+nflxvideo.net
+soundcloud.com
+sndcdn.com
+linkedin.com
+licdn.com
+pinterest.com
+pinimg.com
+rutracker.org
+nnmclub.to
+rutor.info
+flibusta.is
+patreon.com
+boosty.to
+behance.net
+dribbble.com
+
+# Рабочие инструменты, почта и утилиты
+notion.so
+canva.com
+figma.com
+trello.com
+miro.com
+proton.me
+protonmail.com
+tuta.com
+speedtest.net
+2ip.ru
