@@ -1,7 +1,7 @@
 #!/bin/sh
 # setup_vpn.sh — AmneziaWG: зона, forwarding, fwmark->table 100, nft-set, cron
 # Список скачивается ДО любых изменений сети (пока WAN-маршрут точно есть).
-# После снятия route_allowed_ips делается ifup wan для восстановления WAN-маршрута.
+# PersistentKeepalive=25 удерживает NAT-привязку и handshake без route_allowed_ips.
 
 set -e
 
@@ -18,6 +18,7 @@ RT_TABLE_NAME="awg_vpn"
 FWMARK="0x1"
 DNS_TIMEOUT="5"
 HANDSHAKE_TIMEOUT="30"
+KEEPALIVE="25"
 NFT_FILE="/etc/nftables.d/99-awg-domains.nft"
 NFT_INCLUDE_NAME="awg_domains"
 AWG_ZONE_NAME="awg"
@@ -42,7 +43,6 @@ rollback() {
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
-# Ожидание маршрута по умолчанию через WAN. Никаких uci get / ip route replace.
 ensure_wan_default() {
     if timeout 5 ip route show default 2>/dev/null | grep -q 'via'; then
         return 0
@@ -227,6 +227,12 @@ log "  базовые проверки пройдены"
 
 # ==================== 2. HANDSHAKE ====================
 log "2. Обеспечение handshake..."
+# PersistentKeepalive — удерживает NAT-привязку, чтобы handshake не пропадал без route_allowed_ips
+if [ -z "$(uci -q get network.@amneziawg_awg[0].persistent_keepalive 2>/dev/null)" ]; then
+    uci set network.@amneziawg_awg[0].persistent_keepalive="$KEEPALIVE"
+    log "  persistent_keepalive=$KEEPALIVE"
+fi
+
 uci set network.@amneziawg_awg[0].route_allowed_ips='1'
 uci commit network
 ifup awg >/dev/null 2>&1 || true
@@ -307,7 +313,6 @@ uci set network.@amneziawg_awg[0].route_allowed_ips='0'
 uci commit network
 
 log "  route_allowed_ips=0, ifup wan, ifup awg, ждём handshake (до ${HANDSHAKE_TIMEOUT}s)..."
-# Восстанавливаем WAN-маршрут принудительно, не полагаясь на netifd
 ifup wan >/dev/null 2>&1 || true
 sleep 3
 ensure_wan_default
