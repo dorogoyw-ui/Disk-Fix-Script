@@ -214,7 +214,6 @@ fi
 
 # ==================== 2. HANDSHAKE ====================
 log "2. Обеспечение handshake..."
-# Включаем route_allowed_ips (галочку), чтобы kmod применил параметры пира
 uci set network.@amneziawg_awg[0].route_allowed_ips='1'
 uci commit network
 ifup awg >/dev/null 2>&1 || true
@@ -223,7 +222,7 @@ log "  route_allowed_ips=1, ifup awg, ждём handshake..."
 if ! wait_handshake; then
     log "ВНИМАНИЕ: handshake не появился за ${HANDSHAKE_TIMEOUT}s."
     log "  Проверьте: ключи, параметры обфускации (jc/jmin/jmax/s1/s2/h1-h4/i1),"
-    log "  endpoint (8.35.211.5:3581), системное время, доступность UDP."
+    log "  endpoint, системное время, доступность UDP."
     log "  Скрипт продолжит, но маршрут в table $RT_TABLE_ID может не работать."
 else
     log "  handshake появился, туннель активен"
@@ -280,7 +279,8 @@ uci commit firewall
 
 # ==================== 7. МАРШРУТ В TABLE 100 ====================
 log "7. Маршрут в таблице $RT_TABLE_ID..."
-sleep 1
+ifup awg >/dev/null 2>&1 || true
+sleep 2
 if ip link show awg >/dev/null 2>&1; then
     if ! ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
         ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null \
@@ -298,18 +298,23 @@ log "8. Снятие route_allowed_ips (галочки)..."
 uci set network.@amneziawg_awg[0].route_allowed_ips='0'
 uci commit network
 ifup awg >/dev/null 2>&1 || true
-sleep 3
+log "  route_allowed_ips=0, ifup awg, ждём handshake (до ${HANDSHAKE_TIMEOUT}s)..."
 
-if awg show 2>/dev/null | grep -q 'latest handshake'; then
+if wait_handshake; then
     log "  handshake сохранился — выборочная маршрутизация активна"
 else
-    log "  ВНИМАНИЕ: handshake пропал после снятия галочки."
+    log "  ВНИМАНИЕ: handshake не появился за ${HANDSHAKE_TIMEOUT}s после снятия галочки."
     log "  На этой прошивке выборочная маршрутизация невозможна."
     log "  Возвращаю route_allowed_ips=1 (полный туннель)..."
     uci set network.@amneziawg_awg[0].route_allowed_ips='1'
     uci commit network
     ifup awg >/dev/null 2>&1 || true
-    log "  полный туннель восстановлен"
+    if wait_handshake; then
+        log "  полный туннель восстановлен, handshake есть"
+    else
+        log "  ВНИМАНИЕ: handshake не восстановился и в полном туннеле."
+        log "  Проверьте: awg show, logread | grep -i awg, ping endpoint."
+    fi
 fi
 
 # ==================== 9. UPDATE-СКРИПТ ====================
