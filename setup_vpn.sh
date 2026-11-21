@@ -1,7 +1,7 @@
 #!/bin/sh
 # setup_vpn.sh — AmneziaWG: зона, forwarding, fwmark->table 100, nft-set, cron
-# Автоматически: включает route_allowed_ips для handshake, ждёт его, затем снимает.
-# Предполагается: network.awg уже настроен (proto amneziawg, пир, ключи).
+# Список скачивается ДО любых изменений сети (пока WAN-маршрут точно есть).
+# После снятия route_allowed_ips делается ifup wan для восстановления WAN-маршрута.
 
 set -e
 
@@ -42,8 +42,7 @@ rollback() {
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
-# Ожидание маршрута по умолчанию через WAN (netifd обычно восстанавливает сам).
-# Никаких uci get / ip route replace — они могут зависнуть.
+# Ожидание маршрута по умолчанию через WAN. Никаких uci get / ip route replace.
 ensure_wan_default() {
     if timeout 5 ip route show default 2>/dev/null | grep -q 'via'; then
         return 0
@@ -212,6 +211,11 @@ wait_handshake() {
     return 1
 }
 
+# ==================== 0. СКАЧИВАНИЕ СПИСКА (ДО ЛЮБЫХ ИЗМЕНЕНИЙ) ====================
+log "0. Скачивание списка (до изменений сети, пока WAN-маршрут точно есть)..."
+rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
+fetch_list "$TMP_RAW" || die "не удалось скачать список ни с одного зеркала (WAN/DNS?)"
+
 # ==================== 1. ПРОВЕРКА ====================
 log "1. Проверка окружения..."
 [ -f /etc/iproute2/rt_tables ] || die "/etc/iproute2/rt_tables не найден"
@@ -237,25 +241,19 @@ else
     log "  handshake появился, туннель активен"
 fi
 
-# ==================== 3. СКАЧИВАНИЕ ====================
-log "3. Скачивание списка..."
-ensure_wan_default
-rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
-fetch_list "$TMP_RAW" || die "не удалось скачать список ни с одного зеркала"
-
-# ==================== 4. ПАРСИНГ ====================
-log "4. Парсинг списка..."
+# ==================== 3. ПАРСИНГ (список уже скачан) ====================
+log "3. Парсинг списка..."
 parse_list "$TMP_RAW" "$TMP_IPS" || die "не удалось получить ни одного IP"
 IP_COUNT=$(wc -l < "$TMP_IPS" 2>/dev/null || echo 0)
 log "  получено IP/CIDR: $IP_COUNT"
 
-# ==================== 5. NFT ====================
-log "5. Генерация nft-конфига..."
+# ==================== 4. NFT ====================
+log "4. Генерация nft-конфига..."
 gen_nft "$TMP_IPS" "$TMP_NFT" || die "не удалось сгенерировать nft-конфиг"
 cp "$TMP_NFT" "$NFT_FILE"
 
-# ==================== 6. UCI ====================
-log "6. Применение uci-настроек..."
+# ==================== 5. UCI ====================
+log "5. Применение uci-настроек..."
 
 grep -q "$RT_TABLE_ID $RT_TABLE_NAME" /etc/iproute2/rt_tables \
     || echo "$RT_TABLE_ID $RT_TABLE_NAME" >> /etc/iproute2/rt_tables
@@ -287,8 +285,8 @@ uci commit firewall
 /etc/init.d/firewall restart >/dev/null 2>&1 || log "ВНИМАНИЕ: firewall restart вернул ошибку"
 /etc/init.d/network reload   >/dev/null 2>&1 || log "ВНИМАНИЕ: network reload вернул ошибку"
 
-# ==================== 7. МАРШРУТ В TABLE 100 ====================
-log "7. Маршрут в таблице $RT_TABLE_ID..."
+# ==================== 6. МАРШРУТ В TABLE 100 ====================
+log "6. Маршрут в таблице $RT_TABLE_ID..."
 ifup awg >/dev/null 2>&1 || true
 sleep 2
 if ip link show awg >/dev/null 2>&1; then
@@ -303,14 +301,15 @@ else
     log "  ВНИМАНИЕ: awg не поднят — маршрут не создан"
 fi
 
-# ==================== 8. СНЯТИЕ ГАЛОЧКИ ====================
-log "8. Снятие route_allowed_ips (галочки)..."
+# ==================== 7. СНЯТИЕ ГАЛОЧКИ ====================
+log "7. Снятие route_allowed_ips (галочки)..."
 uci set network.@amneziawg_awg[0].route_allowed_ips='0'
 uci commit network
 
-log "  route_allowed_ips=0, network restart, ждём handshake (до ${HANDSHAKE_TIMEOUT}s)..."
-/etc/init.d/network restart >/dev/null 2>&1 || log "  ВНИМАНИЕ: network restart вернул ошибку"
-sleep 5
+log "  route_allowed_ips=0, ifup wan, ifup awg, ждём handshake (до ${HANDSHAKE_TIMEOUT}s)..."
+# Восстанавливаем WAN-маршрут принудительно, не полагаясь на netifd
+ifup wan >/dev/null 2>&1 || true
+sleep 3
 ensure_wan_default
 ifup awg >/dev/null 2>&1 || true
 
@@ -326,8 +325,8 @@ else
     log "  Возвращаю route_allowed_ips=1 (полный туннель)..."
     uci set network.@amneziawg_awg[0].route_allowed_ips='1'
     uci commit network
-    /etc/init.d/network restart >/dev/null 2>&1 || true
-    sleep 5
+    ifup wan >/dev/null 2>&1 || true
+    sleep 3
     ensure_wan_default
     ifup awg >/dev/null 2>&1 || true
     if wait_handshake; then
@@ -338,8 +337,8 @@ else
     fi
 fi
 
-# ==================== 9. UPDATE-СКРИПТ ====================
-log "9. Установка $UPDATE_SCRIPT..."
+# ==================== 8. UPDATE-СКРИПТ ====================
+log "8. Установка $UPDATE_SCRIPT..."
 cat > "$UPDATE_SCRIPT" << 'UPD_EOF'
 #!/bin/sh
 LIST_URL="__LIST_URL__"
@@ -431,8 +430,8 @@ sed -i "s|__MIRRORS__|$MIRRORS_ONELINE|" "$UPDATE_SCRIPT"
 sed -i "s|__DNS_TIMEOUT__|$DNS_TIMEOUT|" "$UPDATE_SCRIPT"
 chmod +x "$UPDATE_SCRIPT"
 
-# ==================== 10. CRON ====================
-log "10. Настройка cron..."
+# ==================== 9. CRON ====================
+log "9. Настройка cron..."
 mkdir -p /etc/crontabs
 touch /etc/crontabs/root
 sed -i "\|$UPDATE_SCRIPT|d" /etc/crontabs/root
