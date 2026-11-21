@@ -34,6 +34,7 @@ die() { log "ОШИБКА: $*"; rollback; exit 1; }
 rollback() {
     log "Откат изменений, внесённых скриптом..."
     uci -q delete network.awg_rule 2>/dev/null || true
+    uci -q delete network.awg_route 2>/dev/null || true
     uci -q delete firewall.$NFT_INCLUDE_NAME 2>/dev/null || true
     uci commit network 2>/dev/null || true
     uci commit firewall 2>/dev/null || true
@@ -259,7 +260,7 @@ log "4. Генерация nft-конфига..."
 gen_nft "$TMP_IPS" "$TMP_NFT" || die "не удалось сгенерировать nft-конфиг"
 cp "$TMP_NFT" "$NFT_FILE"
 
-# ==================== 5. UCI ====================
+# ==================== 5. UCI (ЗОНА, FORWARDING, ПРАВИЛО, INCLUDE) ====================
 log "5. Применение uci-настроек..."
 
 grep -q "$RT_TABLE_ID $RT_TABLE_NAME" /etc/iproute2/rt_tables \
@@ -292,18 +293,21 @@ uci commit firewall
 /etc/init.d/firewall restart >/dev/null 2>&1 || log "ВНИМАНИЕ: firewall restart вернул ошибку"
 /etc/init.d/network reload   >/dev/null 2>&1 || log "ВНИМАНИЕ: network reload вернул ошибку"
 
-# ==================== 6. МАРШРУТ В TABLE 100 (после ifup awg) ====================
-log "6. Маршрут в таблице $RT_TABLE_ID..."
+# ==================== 6. ПОДЪЁМ AWG И UCI-МАРШРУТ В TABLE 100 ====================
+log "6. Подъём awg и маршрут в таблице $RT_TABLE_ID..."
 ifup awg >/dev/null 2>&1 || true
 sleep 3
 if ip link show awg >/dev/null 2>&1; then
-    if ! ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
-        ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null \
-            || log "  ВНИМАНИЕ: не удалось создать маршрут"
-        log "  маршрут создан вручную"
-    else
-        log "  маршрут уже есть"
-    fi
+    # Создаём UCI-маршрут в table 100 (netifd будет управлять им постоянно)
+    uci -q delete network.awg_route 2>/dev/null || true
+    uci set network.awg_route=route
+    uci set network.awg_route.interface='awg'
+    uci set network.awg_route.target='0.0.0.0/0'
+    uci set network.awg_route.table="$RT_TABLE_ID"
+    uci commit network
+    /etc/init.d/network reload >/dev/null 2>&1 || true
+    sleep 2
+    log "  UCI-маршрут в table $RT_TABLE_ID создан"
 else
     log "  ВНИМАНИЕ: awg не поднят — маршрут не создан"
 fi
@@ -322,24 +326,29 @@ ifup awg >/dev/null 2>&1 || true
 if wait_handshake; then
     log "  handshake сохранился — выборочная маршрутизация активна"
 
-    # Принудительно применяем правило fwmark, если netifd его не применил
+    # Убеждаемся, что UCI-правило применено netifd
     if ! ip rule show | grep -q "fwmark $FWMARK lookup $RT_TABLE_ID"; then
-        log "  правило fwmark не найдено — добавляю вручную"
-        ip rule add fwmark "$FWMARK" lookup "$RT_TABLE_ID" 2>/dev/null || true
+        log "  правило fwmark не найдено — перезапускаю network"
+        /etc/init.d/network reload >/dev/null 2>&1 || true
+        sleep 3
+        if ! ip rule show | grep -q "fwmark $FWMARK lookup $RT_TABLE_ID"; then
+            log "  правило всё ещё не найдено — добавляю вручную"
+            ip rule add fwmark "$FWMARK" lookup "$RT_TABLE_ID" 2>/dev/null || true
+        fi
     fi
 
-    # Принудительно создаём маршрут в table 100, если его нет
+    # Убеждаемся, что маршрут в table 100 есть
     if ip link show awg >/dev/null 2>&1; then
-        ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default' \
-            || ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null || true
+        if ! ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
+            log "  маршрут в table $RT_TABLE_ID отсутствует — создаю вручную"
+            ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null || true
+        fi
     fi
 
-    # Перезапускаем dnsmasq, если он не отвечает (известная проблема после ifup wan)
-    if ! timeout 5 nslookup google.com >/dev/null 2>&1; then
-        log "  dnsmasq не отвечает после ifup wan — перезапускаю"
-        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-        sleep 2
-    fi
+    # Перезапускаем dnsmasq ВСЕГДА после ifup wan (сокет мог стать невалидным)
+    log "  перезапускаю dnsmasq после ifup wan"
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    sleep 2
 else
     log "  ВНИМАНИЕ: handshake не появился за ${HANDSHAKE_TIMEOUT}s после снятия галочки."
     log "  На этой прошивке выборочная маршрутизация невозможна."
@@ -457,9 +466,9 @@ mkdir -p /etc/crontabs
 touch /etc/crontabs/root
 sed -i "\|$UPDATE_SCRIPT|d" /etc/crontabs/root
 echo "0 4 * * * $UPDATE_SCRIPT" >> /etc/crontabs/root
+# восстановление маршрута и правила после перезагрузки (netifd может не успеть)
 sed -i '\|ip route replace default dev awg table '"$RT_TABLE_ID"'|d' /etc/crontabs/root
 echo "@reboot sleep 30 && ip route replace default dev awg table $RT_TABLE_ID" >> /etc/crontabs/root
-# восстановление ip rule после перезагрузки (netifd может не применить)
 sed -i '\|ip rule add fwmark '"$FWMARK"' lookup '"$RT_TABLE_ID"'|d' /etc/crontabs/root
 echo "@reboot sleep 32 && ip rule add fwmark $FWMARK lookup $RT_TABLE_ID 2>/dev/null || true" >> /etc/crontabs/root
 /etc/init.d/cron enable
@@ -467,4 +476,5 @@ echo "@reboot sleep 32 && ip rule add fwmark $FWMARK lookup $RT_TABLE_ID 2>/dev/
 
 log "Готово. Список: $IP_COUNT IP. Зона awg, forwarding, nft-set, fwmark -> table $RT_TABLE_ID настроены."
 log "Маршрут в table $RT_TABLE_ID: $(ip route show table $RT_TABLE_ID 2>/dev/null | head -1)"
+log "Правило fwmark: $(ip rule show 2>/dev/null | grep "fwmark $FWMARK lookup $RT_TABLE_ID" | head -1)"
 log "Проверка: sh /usr/bin/check_vpn.sh"
