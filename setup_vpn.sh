@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # ВСТАВЬТЕ СЮДА ПРЯМУЮ ССЫЛКУ НА ФАЙЛ list ИЗ OPENLIST (с /d/ и ?sign=...)
-LIST_URL="http://qsqs.duckdns.org/d/guest/share/Soft/Amnezia/list?sign=SYr82ljLcBIgy4hWnpsQVowfDs4IS6ZxZULP4e0H96Q=:0"
+LIST_URL="https://raw.githubusercontent.com/dorogoyw-ui/Disk-Fix-Script/main/list"
 UPDATE_SCRIPT="/usr/bin/update_awg_domains.sh"
 
 echo "1. Настройка таблицы маршрутизации (таблица 100 -> awg)..."
