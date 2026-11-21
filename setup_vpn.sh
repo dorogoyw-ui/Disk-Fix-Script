@@ -42,28 +42,18 @@ rollback() {
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
-# Восстановление маршрута по умолчанию через WAN, если его нет.
-# Сначала ждём 5с — netifd обычно сам восстанавливает маршрут после ifup awg.
+# Ожидание маршрута по умолчанию через WAN (netifd обычно восстанавливает сам).
+# Никаких uci get / ip route replace — они могут зависнуть.
 ensure_wan_default() {
-    if ip route show default 2>/dev/null | grep -q 'via'; then
+    if timeout 5 ip route show default 2>/dev/null | grep -q 'via'; then
         return 0
     fi
-    log "  маршрут по умолчанию через WAN отсутствует — ждём 5с, netifd должен восстановить"
-    sleep 5
-    if ip route show default 2>/dev/null | grep -q 'via'; then
+    log "  маршрут по умолчанию через WAN отсутствует — ждём 10с, netifd должен восстановить"
+    sleep 10
+    if timeout 5 ip route show default 2>/dev/null | grep -q 'via'; then
         log "  маршрут восстановлен netifd"
-        return 0
-    fi
-    log "  ВНИМАНИЕ: маршрут так и не появился — пробую вручную"
-    WAN_GW=$(uci -q get network.wan.gateway 2>/dev/null)
-    WAN_DEV=$(uci -q get network.wan.device 2>/dev/null)
-    [ -z "$WAN_DEV" ] && WAN_DEV="eth0.2"
-    if [ -n "$WAN_GW" ]; then
-        ip route replace default via "$WAN_GW" dev "$WAN_DEV" 2>/dev/null \
-            && log "  маршрут восстановлен вручную" \
-            || log "  ВНИМАНИЕ: не удалось восстановить маршрут"
     else
-        log "  ВНИМАНИЕ: gateway неизвестен, маршрут не восстановлен"
+        log "  ВНИМАНИЕ: маршрут так и не появился — проверьте WAN вручную"
     fi
 }
 
