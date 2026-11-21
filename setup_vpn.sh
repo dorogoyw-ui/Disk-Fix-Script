@@ -1,6 +1,6 @@
 #!/bin/sh
-# setup_vpn_fixed.sh — AmneziaWG policy routing + domain/IP list updater
-# Порядок: проверка -> скачивание -> парсинг -> nft -> uci -> cron
+# setup_vpn.sh — AmneziaWG policy routing + domain/IP list updater
+# Предполагается: интерфейс awg уже настроен и поднят, "Route Allowed IPs" включён.
 
 set -e
 
@@ -16,11 +16,12 @@ RT_TABLE_ID="100"
 RT_TABLE_NAME="awg_vpn"
 FWMARK="0x1"
 DNS_TIMEOUT="5"
+NFT_FILE="/etc/nftables.d/99-awg-domains.nft"
+NFT_INCLUDE_NAME="awg_domains"
 
 TMP_RAW="/tmp/awg_list.raw"
 TMP_IPS="/tmp/awg_ips.tmp"
 TMP_NFT="/tmp/99-awg-domains.nft"
-FINAL_NFT="/etc/nftables.d/99-awg-domains.nft"
 
 # ==================== ХЕЛПЕРЫ ====================
 log() { logger -t awg-setup "$*"; echo "$*"; }
@@ -29,15 +30,16 @@ die() { log "ОШИБКА: $*"; rollback; exit 1; }
 rollback() {
     log "Откат изменений..."
     uci -q delete network.awg_rule  2>/dev/null || true
-    uci -q delete network.awg_route 2>/dev/null || true
+    uci -q delete firewall.$NFT_INCLUDE_NAME 2>/dev/null || true
     uci commit network 2>/dev/null || true
-    rm -f /etc/nftables.d/99-awg-domains.nft 2>/dev/null || true
+    uci commit firewall 2>/dev/null || true
+    rm -f "$NFT_FILE" 2>/dev/null || true
+    ip route del default dev awg table "$RT_TABLE_ID" 2>/dev/null || true
     /etc/init.d/firewall restart >/dev/null 2>&1 || true
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
 # Резолв через системный dnsmasq (127.0.0.1:53) с таймаутом 5 сек.
-# ВАЖНО: не передаём второй аргумент (внешний DNS) — в musl nslookup он игнорируется и может зависнуть.
 resolve_host() {
     host="$1"
     if command -v timeout >/dev/null 2>&1; then
@@ -121,13 +123,11 @@ log "1. Проверка окружения..."
 [ -f /etc/iproute2/rt_tables ] || die "/etc/iproute2/rt_tables не найден"
 command -v nft >/dev/null 2>&1 || die "nft не найден (нужен fw4/nftables)"
 command -v uci >/dev/null 2>&1 || die "uci не найден"
-if ! uci -q get network.awg >/dev/null 2>&1; then
-    log "ВНИМАНИЕ: интерфейс 'awg' не найден в UCI — маршрут в таблицу $RT_TABLE_ID может не работать"
-fi
+uci -q get network.awg >/dev/null 2>&1 || log "ВНИМАНИЕ: интерфейс 'awg' не найден в UCI"
 
-# Быстрая проверка резолвера
+# Проверка dnsmasq
 if ! timeout "$DNS_TIMEOUT" nslookup google.com >/dev/null 2>&1; then
-    log "ВНИМАНИЕ: dnsmasq не отвечает на google.com — пробую перезапустить..."
+    log "ВНИМАНИЕ: dnsmasq не отвечает — перезапускаю..."
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     sleep 2
 fi
@@ -135,45 +135,62 @@ fi
 # ==================== 2. СКАЧИВАНИЕ ====================
 log "2. Скачивание списка..."
 rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
-fetch_list "$TMP_RAW" || die "не удалось скачать список ни с одного зеркала (DNS/DPI?)"
+fetch_list "$TMP_RAW" || die "не удалось скачать список ни с одного зеркала"
 
 # ==================== 3. ПАРСИНГ ====================
 log "3. Парсинг списка..."
-parse_list "$TMP_RAW" "$TMP_IPS" || die "не удалось получить ни одного IP (DNS-резолвинг не работает?)"
+parse_list "$TMP_RAW" "$TMP_IPS" || die "не удалось получить ни одного IP"
 IP_COUNT=$(wc -l < "$TMP_IPS" 2>/dev/null || echo 0)
 log "  получено IP/CIDR: $IP_COUNT"
 
 # ==================== 4. NFT ====================
 log "4. Генерация nft-конфига..."
 gen_nft "$TMP_IPS" "$TMP_NFT" || die "не удалось сгенерировать nft-конфиг"
+cp "$TMP_NFT" "$NFT_FILE"
 
-# ==================== 5. ПРИМЕНЕНИЕ ПРАВИЛ ====================
-log "5. Применение сетевых правил..."
+# ==================== 5. UCI: правило + include ====================
+log "5. Применение uci-настроек..."
+
+# 5a. Таблица rt_tables
 grep -q "$RT_TABLE_ID $RT_TABLE_NAME" /etc/iproute2/rt_tables \
     || echo "$RT_TABLE_ID $RT_TABLE_NAME" >> /etc/iproute2/rt_tables
 
-uci -q delete network.awg_route
-uci set network.awg_route=route
-uci set network.awg_route.interface='awg'
-uci set network.awg_route.target='0.0.0.0/0'
-uci set network.awg_route.table="$RT_TABLE_ID"
-
+# 5b. Правило fwmark -> table 100 (awg_route НЕ создаём — он уже есть от Route Allowed IPs)
 uci -q delete network.awg_rule
 uci set network.awg_rule=rule
 uci set network.awg_rule.mark="$FWMARK"
 uci set network.awg_rule.lookup="$RT_TABLE_ID"
 uci commit network
 
-cp "$TMP_NFT" "$FINAL_NFT"
+# 5c. Include nft-файла в fw4
+uci -q delete firewall.$NFT_INCLUDE_NAME
+uci set firewall.$NFT_INCLUDE_NAME=include
+uci set firewall.$NFT_INCLUDE_NAME.type='nftables'
+uci set firewall.$NFT_INCLUDE_NAME.path="$NFT_FILE"
+uci set firewall.$NFT_INCLUDE_NAME.position='table-append'
+uci commit firewall
+
+# 5d. Применение
 /etc/init.d/firewall restart >/dev/null 2>&1 || log "ВНИМАНИЕ: firewall restart вернул ошибку"
 /etc/init.d/network reload   >/dev/null 2>&1 || log "ВНИМАНИЕ: network reload вернул ошибку"
+
+# 5e. Гарантия маршрута в таблице 100
+sleep 1
+if ! ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
+    log "  маршрут в таблице $RT_TABLE_ID отсутствует — создаю вручную"
+    ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null \
+        || log "  ВНИМАНИЕ: не удалось создать маршрут (awg не поднят?)"
+    # прописываем в rc.local, чтобы восстанавливалось после перезагрузки
+    if ! grep -q "ip route replace default dev awg table $RT_TABLE_ID" /etc/rc.local 2>/dev/null; then
+        sed -i "/^exit 0/i ip route replace default dev awg table $RT_TABLE_ID" /etc/rc.local 2>/dev/null || true
+    fi
+fi
 
 # ==================== 6. UPDATE-СКРИПТ ====================
 log "6. Установка $UPDATE_SCRIPT..."
 cat > "$UPDATE_SCRIPT" << 'UPD_EOF'
 #!/bin/sh
-# update_awg_domains.sh — обновление списка и nft-сета (автообновление)
-
+# update_awg_domains.sh — обновление списка и nft-сета
 LIST_URL="__LIST_URL__"
 LIST_MIRRORS="__MIRRORS__"
 DNS_TIMEOUT="__DNS_TIMEOUT__"
@@ -257,7 +274,6 @@ fi
 rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
 UPD_EOF
 
-# Подстановка параметров в update-скрипт
 sed -i "s|__LIST_URL__|$LIST_URL|" "$UPDATE_SCRIPT"
 MIRRORS_ONELINE=$(echo "$LIST_MIRRORS" | tr '\n' ' ')
 sed -i "s|__MIRRORS__|$MIRRORS_ONELINE|" "$UPDATE_SCRIPT"
@@ -273,5 +289,5 @@ echo "0 4 * * * $UPDATE_SCRIPT" >> /etc/crontabs/root
 /etc/init.d/cron enable
 /etc/init.d/cron restart
 
-log "Готово. Список загружен ($IP_COUNT IP), правила применены."
-log "Проверка: ip rule show | grep 0x1 ; ip route show table $RT_TABLE_ID ; nft list set inet fw4 vpn_domains | head"
+log "Готово. Список загружен ($IP_COUNT IP), правило fwmark применено."
+log "Проверка: sh /usr/bin/check_vpn.sh"
