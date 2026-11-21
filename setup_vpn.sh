@@ -39,6 +39,7 @@ rollback() {
     uci commit firewall 2>/dev/null || true
     rm -f "$NFT_FILE" 2>/dev/null || true
     ip route del default dev awg table "$RT_TABLE_ID" 2>/dev/null || true
+    ip rule del fwmark "$FWMARK" lookup "$RT_TABLE_ID" 2>/dev/null || true
     /etc/init.d/firewall restart >/dev/null 2>&1 || true
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
@@ -291,10 +292,10 @@ uci commit firewall
 /etc/init.d/firewall restart >/dev/null 2>&1 || log "ВНИМАНИЕ: firewall restart вернул ошибку"
 /etc/init.d/network reload   >/dev/null 2>&1 || log "ВНИМАНИЕ: network reload вернул ошибку"
 
-# ==================== 6. МАРШРУТ В TABLE 100 ====================
+# ==================== 6. МАРШРУТ В TABLE 100 (после ifup awg) ====================
 log "6. Маршрут в таблице $RT_TABLE_ID..."
 ifup awg >/dev/null 2>&1 || true
-sleep 2
+sleep 3
 if ip link show awg >/dev/null 2>&1; then
     if ! ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
         ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null \
@@ -320,9 +321,24 @@ ifup awg >/dev/null 2>&1 || true
 
 if wait_handshake; then
     log "  handshake сохранился — выборочная маршрутизация активна"
+
+    # Принудительно применяем правило fwmark, если netifd его не применил
+    if ! ip rule show | grep -q "fwmark $FWMARK lookup $RT_TABLE_ID"; then
+        log "  правило fwmark не найдено — добавляю вручную"
+        ip rule add fwmark "$FWMARK" lookup "$RT_TABLE_ID" 2>/dev/null || true
+    fi
+
+    # Принудительно создаём маршрут в table 100, если его нет
     if ip link show awg >/dev/null 2>&1; then
         ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default' \
             || ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null || true
+    fi
+
+    # Перезапускаем dnsmasq, если он не отвечает (известная проблема после ifup wan)
+    if ! timeout 5 nslookup google.com >/dev/null 2>&1; then
+        log "  dnsmasq не отвечает после ifup wan — перезапускаю"
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+        sleep 2
     fi
 else
     log "  ВНИМАНИЕ: handshake не появился за ${HANDSHAKE_TIMEOUT}s после снятия галочки."
@@ -443,6 +459,9 @@ sed -i "\|$UPDATE_SCRIPT|d" /etc/crontabs/root
 echo "0 4 * * * $UPDATE_SCRIPT" >> /etc/crontabs/root
 sed -i '\|ip route replace default dev awg table '"$RT_TABLE_ID"'|d' /etc/crontabs/root
 echo "@reboot sleep 30 && ip route replace default dev awg table $RT_TABLE_ID" >> /etc/crontabs/root
+# восстановление ip rule после перезагрузки (netifd может не применить)
+sed -i '\|ip rule add fwmark '"$FWMARK"' lookup '"$RT_TABLE_ID"'|d' /etc/crontabs/root
+echo "@reboot sleep 32 && ip rule add fwmark $FWMARK lookup $RT_TABLE_ID 2>/dev/null || true" >> /etc/crontabs/root
 /etc/init.d/cron enable
 /etc/init.d/cron restart
 
