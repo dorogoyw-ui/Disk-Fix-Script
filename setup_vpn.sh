@@ -1,7 +1,6 @@
 #!/bin/sh
-# setup_vpn.sh — AmneziaWG: полный туннель + выборочная маршрутизация (таблица 100)
-# Предполагается: интерфейс awg уже настроен в UCI (proto amneziawg, пир, ключи).
-# Скрипт НЕ пересоздаёт awg, а донастраивает firewall, зону, forwarding, nft-set, cron.
+# setup_vpn.sh — AmneziaWG: зона firewall, forwarding, fwmark->table 100, nft-set, cron
+# Предполагается: network.awg уже настроен (proto amneziawg, пир, ключи).
 
 set -e
 
@@ -26,10 +25,10 @@ TMP_IPS="/tmp/awg_ips.tmp"
 TMP_NFT="/tmp/99-awg-domains.nft"
 
 # ==================== ХЕЛПЕРЫ ====================
+# log пишет в stderr — чтобы не попадать в stdout функций, возвращающих значение
 log() { logger -t awg-setup "$*"; echo "$*" >&2; }
 die() { log "ОШИБКА: $*"; rollback; exit 1; }
 
-# Откат: удаляем ТОЛЬКО то, что создал скрипт (правило, include, nft-файл, маршрут в table 100).
 rollback() {
     log "Откат изменений, внесённых скриптом..."
     uci -q delete network.awg_rule 2>/dev/null || true
@@ -42,7 +41,6 @@ rollback() {
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
-# Резолв через системный dnsmasq (127.0.0.1:53). Без второго аргумента.
 resolve_host() {
     host="$1"
     if command -v timeout >/dev/null 2>&1; then
@@ -56,7 +54,6 @@ resolve_host() {
     fi
 }
 
-# Скачивание с перебором зеркал. $1 — целевой файл.
 fetch_list() {
     target="$1"
     for url in "$LIST_URL" $LIST_MIRRORS; do
@@ -76,7 +73,6 @@ fetch_list() {
     return 1
 }
 
-# Парсинг: $1 — входной файл, $2 — выходной с IP/CIDR
 parse_list() {
     in="$1"; out="$2"
     ENTRIES=$(sed 's/\r//g; s/#.*//g; s/^[[:space:]]*//; s/[[:space:]]*$//' "$in" | grep -v '^$')
@@ -101,7 +97,6 @@ parse_list() {
     [ -s "$out" ]
 }
 
-# Генерация nft-конфига. $1 — файл с IP, $2 — выходной nft
 gen_nft() {
     ips_file="$1"; nft_file="$2"
     SORTED_IPS=$(tr '\n' ',' < "$ips_file" | sed 's/,$//')
@@ -121,7 +116,7 @@ chain mangle_prerouting_awg {
 NFT_EOF
 }
 
-# Найти индекс зоны awg в firewall (или создать). Возвращает индекс в stdout.
+# Возвращает индекс зоны awg в stdout (без логов)
 ensure_awg_zone() {
     idx=""
     for i in $(uci show firewall | grep -oE '@zone\[[0-9]+\]=zone' | grep -oE '[0-9]+'); do
@@ -146,13 +141,11 @@ ensure_awg_zone() {
         log "  зона $AWG_ZONE_NAME уже существует (index $idx)"
     fi
 
-    # Привязываем интерфейс awg к зоне, если ещё не привязан
     if ! uci -q get firewall.@zone[$idx].network 2>/dev/null | grep -qw 'awg'; then
         uci add_list firewall.@zone[$idx].network='awg'
         log "  зона $AWG_ZONE_NAME привязана к интерфейсу awg"
     fi
 
-    # Убеждаемся, что masq/mtu_fix/forward включены
     uci set firewall.@zone[$idx].masq='1'
     uci set firewall.@zone[$idx].mtu_fix='1'
     uci set firewall.@zone[$idx].forward='ACCEPT'
@@ -160,7 +153,6 @@ ensure_awg_zone() {
     echo "$idx"
 }
 
-# Убедиться, что forwarding lan -> awg существует и он один
 ensure_forwarding() {
     indices=""
     for i in $(uci show firewall | grep -oE '@forwarding\[[0-9]+\]=forwarding' | grep -oE '[0-9]+'); do
@@ -237,12 +229,13 @@ log "  зона awg: index $ZONE_IDX"
 
 ensure_forwarding
 
-uci -q delete network.awg_rule
+# ВАЖНО: || true после каждого uci -q delete
+uci -q delete network.awg_rule 2>/dev/null || true
 uci set network.awg_rule=rule
 uci set network.awg_rule.mark="$FWMARK"
 uci set network.awg_rule.lookup="$RT_TABLE_ID"
 
-uci -q delete firewall.$NFT_INCLUDE_NAME
+uci -q delete firewall.$NFT_INCLUDE_NAME 2>/dev/null || true
 uci set firewall.$NFT_INCLUDE_NAME=include
 uci set firewall.$NFT_INCLUDE_NAME.type='nftables'
 uci set firewall.$NFT_INCLUDE_NAME.path="$NFT_FILE"
