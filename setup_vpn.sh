@@ -42,24 +42,28 @@ rollback() {
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
-# Восстановление маршрута по умолчанию через WAN, если его нет
+# Восстановление маршрута по умолчанию через WAN, если его нет.
+# Сначала ждём 5с — netifd обычно сам восстанавливает маршрут после ifup awg.
 ensure_wan_default() {
     if ip route show default 2>/dev/null | grep -q 'via'; then
         return 0
     fi
-    log "  маршрут по умолчанию через WAN отсутствует — восстанавливаю"
-    WAN_GW=$(uci -q get network.wan.gateway 2>/dev/null)
-    if [ -z "$WAN_GW" ]; then
-        WAN_GW=$(ip route show default 2>/dev/null | awk '/via/ {print $3}' | head -1)
+    log "  маршрут по умолчанию через WAN отсутствует — ждём 5с, netifd должен восстановить"
+    sleep 5
+    if ip route show default 2>/dev/null | grep -q 'via'; then
+        log "  маршрут восстановлен netifd"
+        return 0
     fi
+    log "  ВНИМАНИЕ: маршрут так и не появился — пробую вручную"
+    WAN_GW=$(uci -q get network.wan.gateway 2>/dev/null)
     WAN_DEV=$(uci -q get network.wan.device 2>/dev/null)
     [ -z "$WAN_DEV" ] && WAN_DEV="eth0.2"
     if [ -n "$WAN_GW" ]; then
         ip route replace default via "$WAN_GW" dev "$WAN_DEV" 2>/dev/null \
-            && log "  маршрут восстановлен: default via $WAN_GW dev $WAN_DEV" \
+            && log "  маршрут восстановлен вручную" \
             || log "  ВНИМАНИЕ: не удалось восстановить маршрут"
     else
-        log "  ВНИМАНИЕ: не удалось определить WAN-шлюз"
+        log "  ВНИМАНИЕ: gateway неизвестен, маршрут не восстановлен"
     fi
 }
 
@@ -246,22 +250,6 @@ fi
 # ==================== 3. СКАЧИВАНИЕ ====================
 log "3. Скачивание списка..."
 ensure_wan_default
-
-# Ожидание DNS (до 30 секунд), без принудительного перезапуска dnsmasq
-dns_ok=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    if timeout "$DNS_TIMEOUT" nslookup google.com >/dev/null 2>&1; then
-        dns_ok=1
-        break
-    fi
-    sleep 2
-done
-if [ "$dns_ok" = "1" ]; then
-    log "  DNS отвечает"
-else
-    log "  ВНИМАНИЕ: DNS не отвечает за 30s — пробую скачать список всё равно"
-fi
-
 rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
 fetch_list "$TMP_RAW" || die "не удалось скачать список ни с одного зеркала"
 
