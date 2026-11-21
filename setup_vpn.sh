@@ -42,6 +42,27 @@ rollback() {
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
+# Восстановление маршрута по умолчанию через WAN, если его нет
+ensure_wan_default() {
+    if ip route show default 2>/dev/null | grep -q 'via'; then
+        return 0
+    fi
+    log "  маршрут по умолчанию через WAN отсутствует — восстанавливаю"
+    WAN_GW=$(uci -q get network.wan.gateway 2>/dev/null)
+    if [ -z "$WAN_GW" ]; then
+        WAN_GW=$(ip route show default 2>/dev/null | awk '/via/ {print $3}' | head -1)
+    fi
+    WAN_DEV=$(uci -q get network.wan.device 2>/dev/null)
+    [ -z "$WAN_DEV" ] && WAN_DEV="eth0.2"
+    if [ -n "$WAN_GW" ]; then
+        ip route replace default via "$WAN_GW" dev "$WAN_DEV" 2>/dev/null \
+            && log "  маршрут восстановлен: default via $WAN_GW dev $WAN_DEV" \
+            || log "  ВНИМАНИЕ: не удалось восстановить маршрут"
+    else
+        log "  ВНИМАНИЕ: не удалось определить WAN-шлюз"
+    fi
+}
+
 resolve_host() {
     host="$1"
     if command -v timeout >/dev/null 2>&1; then
@@ -205,11 +226,20 @@ command -v uci >/dev/null 2>&1 || die "uci не найден"
 command -v awg >/dev/null 2>&1 || die "awg не найден (amneziawg-tools)"
 uci -q get network.awg >/dev/null 2>&1 || die "network.awg не настроен — сначала настройте AmneziaWG в LuCI"
 
-if ! timeout "$DNS_TIMEOUT" nslookup google.com >/dev/null 2>&1; then
-    log "ВНИМАНИЕ: dnsmasq не отвечает — перезапускаю..."
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+# Проверка DNS с ожиданием до 20 секунд
+dns_ok=0
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if timeout "$DNS_TIMEOUT" nslookup google.com >/dev/null 2>&1; then
+        dns_ok=1
+        break
+    fi
+    if [ "$i" = "3" ]; then
+        log "ВНИМАНИЕ: dnsmasq не отвечает — перезапускаю..."
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    fi
     sleep 2
-fi
+done
+[ "$dns_ok" = "1" ] || log "ВНИМАНИЕ: dnsmasq не ответил за 20s — загрузка списка может упасть"
 
 # ==================== 2. HANDSHAKE ====================
 log "2. Обеспечение handshake..."
@@ -229,6 +259,8 @@ fi
 
 # ==================== 3. СКАЧИВАНИЕ ====================
 log "3. Скачивание списка..."
+# Проверка маршрута по умолчанию перед загрузкой
+ensure_wan_default
 rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
 fetch_list "$TMP_RAW" || die "не удалось скачать список ни с одного зеркала"
 
@@ -297,13 +329,16 @@ log "8. Снятие route_allowed_ips (галочки)..."
 uci set network.@amneziawg_awg[0].route_allowed_ips='0'
 uci commit network
 
-log "  route_allowed_ips=0, restart wan, ifup awg, ждём handshake (до ${HANDSHAKE_TIMEOUT}s)..."
+log "  route_allowed_ips=0, network restart, ждём handshake (до ${HANDSHAKE_TIMEOUT}s)..."
 /etc/init.d/network restart >/dev/null 2>&1 || log "  ВНИМАНИЕ: network restart вернул ошибку"
 sleep 5
+# После network restart маршрут по умолчанию через WAN мог не восстановиться
+ensure_wan_default
 ifup awg >/dev/null 2>&1 || true
 
 if wait_handshake; then
     log "  handshake сохранился — выборочная маршрутизация активна"
+    # Восстановление маршрута в table 100, если network restart его удалил
     if ip link show awg >/dev/null 2>&1; then
         ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default' \
             || ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null || true
@@ -316,6 +351,7 @@ else
     uci commit network
     /etc/init.d/network restart >/dev/null 2>&1 || true
     sleep 5
+    ensure_wan_default
     ifup awg >/dev/null 2>&1 || true
     if wait_handshake; then
         log "  полный туннель восстановлен, handshake есть"
