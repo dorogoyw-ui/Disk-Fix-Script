@@ -1,17 +1,19 @@
+
 #!/bin/sh
-# setup_vpn.sh — AmneziaWG: зона, forwarding, fwmark->table 100, nft-set, cron
-# Список скачивается ДО любых изменений сети (пока WAN-маршрут точно есть).
-# PersistentKeepalive=25 удерживает NAT-привязку и handshake без route_allowed_ips.
+# setup_vpn.sh — AmneziaWG: выборочная маршрутизация через nftables
+# Policy routing: fwmark 0x1 -> table 100
 
 set -e
 
-# ==================== КОНФИГ ====================
+# ==================== CONFIG ====================
+
 LIST_URL="https://raw.githubusercontent.com/dorogoyw-ui/Disk-Fix-Script/main/list"
 LIST_MIRRORS="
 https://cdn.jsdelivr.net/gh/dorogoyw-ui/Disk-Fix-Script@main/list
 https://ghproxy.net/https://raw.githubusercontent.com/dorogoyw-ui/Disk-Fix-Script/main/list
 https://raw.gitmirror.com/dorogoyw-ui/Disk-Fix-Script/main/list
 "
+
 UPDATE_SCRIPT="/usr/bin/update_awg_domains.sh"
 RT_TABLE_ID="100"
 RT_TABLE_NAME="awg_vpn"
@@ -27,55 +29,83 @@ TMP_RAW="/tmp/awg_list.raw"
 TMP_IPS="/tmp/awg_ips.tmp"
 TMP_NFT="/tmp/99-awg-domains.nft"
 
-# ==================== ХЕЛПЕРЫ ====================
-log() { logger -t awg-setup "$*"; echo "$*" >&2; }
-die() { log "ОШИБКА: $*"; rollback; exit 1; }
+ORIGINAL_ROUTE_ALLOWED_IPS="$(uci -q get network.@amneziawg_awg[0].route_allowed_ips 2>/dev/null || true)"
+
+# ==================== HELPERS ====================
+
+log() {
+    logger -t awg-setup "$*"
+    echo "$*" >&2
+}
+
+die() {
+    log "ОШИБКА: $*"
+    rollback
+    exit 1
+}
 
 rollback() {
-    log "Откат изменений, внесённых скриптом..."
+    log "Откат изменений..."
+
+    if [ -n "$ORIGINAL_ROUTE_ALLOWED_IPS" ]; then
+        uci set network.@amneziawg_awg[0].route_allowed_ips="$ORIGINAL_ROUTE_ALLOWED_IPS" 2>/dev/null || true
+    else
+        uci -q delete network.@amneziawg_awg[0].route_allowed_ips 2>/dev/null || true
+    fi
+
     uci -q delete network.awg_rule 2>/dev/null || true
     uci -q delete network.awg_route 2>/dev/null || true
     uci -q delete firewall.$NFT_INCLUDE_NAME 2>/dev/null || true
+
     uci commit network 2>/dev/null || true
     uci commit firewall 2>/dev/null || true
+
     rm -f "$NFT_FILE" 2>/dev/null || true
+
     ip route del default dev awg table "$RT_TABLE_ID" 2>/dev/null || true
     ip rule del fwmark "$FWMARK" lookup "$RT_TABLE_ID" 2>/dev/null || true
+
     /etc/init.d/firewall restart >/dev/null 2>&1 || true
     /etc/init.d/network reload >/dev/null 2>&1 || true
 }
 
 ensure_wan_default() {
-    if timeout 5 ip route show default 2>/dev/null | grep -q 'via'; then
+    if ip -4 route show table main default 2>/dev/null | grep -qv 'dev awg'; then
         return 0
     fi
-    log "  маршрут по умолчанию через WAN отсутствует — ждём 10с, netifd должен восстановить"
+
+    log "WAN default-маршрут отсутствует — ждём 10 секунд"
     sleep 10
-    if timeout 5 ip route show default 2>/dev/null | grep -q 'via'; then
-        log "  маршрут восстановлен netifd"
+
+    if ip -4 route show table main default 2>/dev/null | grep -qv 'dev awg'; then
+        log "WAN default-маршрут восстановлен"
     else
-        log "  ВНИМАНИЕ: маршрут так и не появился — проверьте WAN вручную"
+        log "ВНИМАНИЕ: WAN default-маршрут не появился"
     fi
 }
 
 resolve_host() {
     host="$1"
+
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$DNS_TIMEOUT" nslookup "$host" 2>/dev/null \
-            | awk '/^Address [0-9]+: / {print $3}' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+        timeout "$DNS_TIMEOUT" nslookup "$host" 2>/dev/null |
+            awk '/^Address [0-9]+: / {print $3}' |
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
     else
-        nslookup "$host" 2>/dev/null \
-            | awk '/^Address [0-9]+: / {print $3}' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+        nslookup "$host" 2>/dev/null |
+            awk '/^Address [0-9]+: / {print $3}' |
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
     fi
 }
 
 fetch_list() {
     target="$1"
+
     for url in "$LIST_URL" $LIST_MIRRORS; do
         [ -z "$url" ] && continue
-        log "  пробую: $url"
+
+        log "Пробую: $url"
+
         if command -v curl >/dev/null 2>&1; then
             if curl -4 -fsSL --connect-timeout 15 --max-time 120 -o "$target" "$url"; then
                 [ -s "$target" ] && return 0
@@ -85,39 +115,58 @@ fetch_list() {
                 [ -s "$target" ] && return 0
             fi
         fi
+
         rm -f "$target"
     done
+
     return 1
 }
 
 parse_list() {
-    in="$1"; out="$2"
+    in="$1"
+    out="$2"
+
     ENTRIES=$(sed 's/\r//g; s/#.*//g; s/^[[:space:]]*//; s/[[:space:]]*$//' "$in" | grep -v '^$')
+
     [ -n "$ENTRIES" ] || return 1
+
     > "$out"
+
     COUNT=0
+
     echo "$ENTRIES" | while IFS= read -r entry; do
         [ -z "$entry" ] && continue
+
         COUNT=$((COUNT+1))
-        [ $((COUNT % 10)) -eq 0 ] && log "  обработано $COUNT записей..."
+
+        [ $((COUNT % 10)) -eq 0 ] && log "Обработано $COUNT записей..."
+
         if echo "$entry" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
             echo "$entry" >> "$out"
         else
             resolve_host "$entry" >> "$out" 2>/dev/null || true
+
             case "$entry" in
                 www.*|*.*.*) ;;
                 *) resolve_host "www.$entry" >> "$out" 2>/dev/null || true ;;
             esac
         fi
     done
-    sort -u "$out" -o "$out" 2>/dev/null || { sort -u "$out" > "$out.tmp" && mv "$out.tmp" "$out"; }
+
+    sort -u "$out" -o "$out" 2>/dev/null ||
+        { sort -u "$out" > "$out.tmp" && mv "$out.tmp" "$out"; }
+
     [ -s "$out" ]
 }
 
 gen_nft() {
-    ips_file="$1"; nft_file="$2"
+    ips_file="$1"
+    nft_file="$2"
+
     SORTED_IPS=$(tr '\n' ',' < "$ips_file" | sed 's/,$//')
+
     [ -n "$SORTED_IPS" ] || return 1
+
     cat > "$nft_file" << NFT_EOF
 set vpn_domains {
     type ipv4_addr
@@ -135,6 +184,7 @@ NFT_EOF
 
 ensure_awg_zone() {
     idx=""
+
     for i in $(uci show firewall | grep -oE '@zone\[[0-9]+\]=zone' | grep -oE '[0-9]+'); do
         if [ "$(uci -q get firewall.@zone[$i].name)" = "$AWG_ZONE_NAME" ]; then
             idx="$i"
@@ -145,6 +195,7 @@ ensure_awg_zone() {
     if [ -z "$idx" ]; then
         uci add firewall zone >/dev/null
         idx=$(( $(uci show firewall | grep -cE '@zone\[[0-9]+\]=zone') - 1 ))
+
         uci set firewall.@zone[$idx].name="$AWG_ZONE_NAME"
         uci set firewall.@zone[$idx].input='REJECT'
         uci set firewall.@zone[$idx].output='ACCEPT'
@@ -152,14 +203,14 @@ ensure_awg_zone() {
         uci set firewall.@zone[$idx].masq='1'
         uci set firewall.@zone[$idx].masq6='1'
         uci set firewall.@zone[$idx].mtu_fix='1'
-        log "  создана зона $AWG_ZONE_NAME (index $idx)"
+
+        log "Создана зона $AWG_ZONE_NAME"
     else
-        log "  зона $AWG_ZONE_NAME уже существует (index $idx)"
+        log "Зона $AWG_ZONE_NAME уже существует (index $idx)"
     fi
 
     if ! uci -q get firewall.@zone[$idx].network 2>/dev/null | grep -qw 'awg'; then
         uci add_list firewall.@zone[$idx].network='awg'
-        log "  зона $AWG_ZONE_NAME привязана к интерфейсу awg"
     fi
 
     uci set firewall.@zone[$idx].masq='1'
@@ -171,6 +222,7 @@ ensure_awg_zone() {
 
 ensure_forwarding() {
     indices=""
+
     for i in $(uci show firewall | grep -oE '@forwarding\[[0-9]+\]=forwarding' | grep -oE '[0-9]+'); do
         if [ "$(uci -q get firewall.@forwarding[$i].dest)" = "$AWG_ZONE_NAME" ]; then
             indices="$indices $i"
@@ -184,104 +236,126 @@ ensure_forwarding() {
         uci add firewall forwarding >/dev/null
         uci set firewall.@forwarding[-1].src='lan'
         uci set firewall.@forwarding[-1].dest="$AWG_ZONE_NAME"
-        log "  добавлен forwarding lan -> $AWG_ZONE_NAME"
+
+        log "Добавлен forwarding lan -> awg"
+
     elif [ "$count" -gt 1 ]; then
         first=1
+
         for i in $indices; do
             if [ "$first" = "1" ]; then
                 first=0
                 continue
             fi
+
             uci delete firewall.@forwarding[$i]
-            log "  удалён дубль forwarding[$i]"
+            log "Удалён дублирующий forwarding[$i]"
         done
     else
-        log "  forwarding lan -> $AWG_ZONE_NAME уже есть (1 шт.)"
+        log "Forwarding lan -> awg уже существует"
     fi
 }
 
 wait_handshake() {
     elapsed=0
+
     while [ "$elapsed" -lt "$HANDSHAKE_TIMEOUT" ]; do
         if awg show 2>/dev/null | grep -q 'latest handshake'; then
             return 0
         fi
+
         sleep 2
         elapsed=$((elapsed + 2))
-        log "  ожидание handshake... ${elapsed}s"
+
+        log "Ожидание handshake: ${elapsed}s"
     done
+
     return 1
 }
 
-# ==================== 0. СКАЧИВАНИЕ СПИСКА (ДО ЛЮБЫХ ИЗМЕНЕНИЙ) ====================
-log "0. Скачивание списка (до изменений сети, пока WAN-маршрут точно есть)..."
-rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
-fetch_list "$TMP_RAW" || die "не удалось скачать список ни с одного зеркала (WAN/DNS?)"
+# ==================== 0. DOWNLOAD ====================
 
-# ==================== 1. ПРОВЕРКА ====================
+log "0. Скачивание списка..."
+
+rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
+
+fetch_list "$TMP_RAW" || die "Не удалось скачать список"
+
+# ==================== 1. CHECK ====================
+
 log "1. Проверка окружения..."
-[ -f /etc/iproute2/rt_tables ] || die "/etc/iproute2/rt_tables не найден"
-command -v nft >/dev/null 2>&1 || die "nft не найден (нужен fw4/nftables)"
-command -v uci >/dev/null 2>&1 || die "uci не найден"
-command -v awg >/dev/null 2>&1 || die "awg не найден (amneziawg-tools)"
-uci -q get network.awg >/dev/null 2>&1 || die "network.awg не настроен — сначала настройте AmneziaWG в LuCI"
-log "  базовые проверки пройдены"
+
+[ -f /etc/iproute2/rt_tables ] || die "Нет rt_tables"
+command -v nft >/dev/null 2>&1 || die "Нет nft"
+command -v uci >/dev/null 2>&1 || die "Нет uci"
+command -v awg >/dev/null 2>&1 || die "Нет awg"
+
+uci -q get network.awg >/dev/null 2>&1 ||
+    die "network.awg не настроен"
+
+log "Базовые проверки пройдены"
 
 # ==================== 2. HANDSHAKE ====================
+
 log "2. Обеспечение handshake..."
-# PersistentKeepalive — удерживает NAT-привязку, чтобы handshake не пропадал без route_allowed_ips
+
 if [ -z "$(uci -q get network.@amneziawg_awg[0].persistent_keepalive 2>/dev/null)" ]; then
     uci set network.@amneziawg_awg[0].persistent_keepalive="$KEEPALIVE"
-    log "  persistent_keepalive=$KEEPALIVE"
 fi
 
 uci set network.@amneziawg_awg[0].route_allowed_ips='1'
 uci commit network
+
 ifup awg >/dev/null 2>&1 || true
-log "  route_allowed_ips=1, ifup awg, ждём handshake..."
 
 if ! wait_handshake; then
-    log "ВНИМАНИЕ: handshake не появился за ${HANDSHAKE_TIMEOUT}s."
-    log "  Проверьте: ключи, параметры обфускации (jc/jmin/jmax/s1/s2/h1-h4/i1),"
-    log "  endpoint, системное время, доступность UDP."
-    log "  Скрипт продолжит, но маршрут в table $RT_TABLE_ID может не работать."
+    log "ВНИМАНИЕ: handshake не появился"
 else
-    log "  handshake появился, туннель активен"
+    log "Handshake появился"
 fi
 
-# ==================== 3. ПАРСИНГ (список уже скачан) ====================
+# ==================== 3. PARSE ====================
+
 log "3. Парсинг списка..."
-parse_list "$TMP_RAW" "$TMP_IPS" || die "не удалось получить ни одного IP"
-IP_COUNT=$(wc -l < "$TMP_IPS" 2>/dev/null || echo 0)
-log "  получено IP/CIDR: $IP_COUNT"
+
+parse_list "$TMP_RAW" "$TMP_IPS" ||
+    die "Не удалось получить IP"
+
+IP_COUNT=$(wc -l < "$TMP_IPS")
+
+log "Получено IP/CIDR: $IP_COUNT"
 
 # ==================== 4. NFT ====================
+
 log "4. Генерация nft-конфига..."
-gen_nft "$TMP_IPS" "$TMP_NFT" || die "не удалось сгенерировать nft-конфиг"
+
+mkdir -p /etc/nftables.d
+
+gen_nft "$TMP_IPS" "$TMP_NFT" ||
+    die "Не удалось создать nft-конфиг"
+
 cp "$TMP_NFT" "$NFT_FILE"
 
-# ==================== 5. UCI (ЗОНА, FORWARDING, ПРАВИЛО, INCLUDE) ====================
-log "5. Применение uci-настроек..."
+# ==================== 5. UCI ====================
 
-grep -q "$RT_TABLE_ID $RT_TABLE_NAME" /etc/iproute2/rt_tables \
-    || echo "$RT_TABLE_ID $RT_TABLE_NAME" >> /etc/iproute2/rt_tables
+log "5. Настройка UCI..."
 
-if [ "$(uci -q get network.awg.auto)" != "1" ]; then
-    uci set network.awg.auto='1'
-    log "  network.awg.auto=1"
-fi
+grep -q "$RT_TABLE_ID $RT_TABLE_NAME" /etc/iproute2/rt_tables ||
+    echo "$RT_TABLE_ID $RT_TABLE_NAME" >> /etc/iproute2/rt_tables
+
+uci set network.awg.auto='1'
 
 ZONE_IDX=$(ensure_awg_zone)
-log "  зона awg: index $ZONE_IDX"
+
+log "Зона awg: index $ZONE_IDX"
 
 ensure_forwarding
 
 uci -q delete network.awg_rule 2>/dev/null || true
-uci set network.awg_rule=rule
-uci set network.awg_rule.mark="$FWMARK"
-uci set network.awg_rule.lookup="$RT_TABLE_ID"
+uci -q delete network.awg_route 2>/dev/null || true
 
 uci -q delete firewall.$NFT_INCLUDE_NAME 2>/dev/null || true
+
 uci set firewall.$NFT_INCLUDE_NAME=include
 uci set firewall.$NFT_INCLUDE_NAME.type='nftables'
 uci set firewall.$NFT_INCLUDE_NAME.path="$NFT_FILE"
@@ -290,134 +364,203 @@ uci set firewall.$NFT_INCLUDE_NAME.position='table-append'
 uci commit network
 uci commit firewall
 
-/etc/init.d/firewall restart >/dev/null 2>&1 || log "ВНИМАНИЕ: firewall restart вернул ошибку"
-/etc/init.d/network reload   >/dev/null 2>&1 || log "ВНИМАНИЕ: network reload вернул ошибку"
+/etc/init.d/firewall restart >/dev/null 2>&1 ||
+    log "ВНИМАНИЕ: ошибка перезапуска firewall"
 
-# ==================== 6. ПОДЪЁМ AWG И UCI-МАРШРУТ В TABLE 100 ====================
-log "6. Подъём awg и маршрут в таблице $RT_TABLE_ID..."
-ifup awg >/dev/null 2>&1 || true
-sleep 3
-if ip link show awg >/dev/null 2>&1; then
-    # Создаём UCI-маршрут в table 100 (netifd будет управлять им постоянно)
-    uci -q delete network.awg_route 2>/dev/null || true
-    uci set network.awg_route=route
-    uci set network.awg_route.interface='awg'
-    uci set network.awg_route.target='0.0.0.0/0'
-    uci set network.awg_route.table="$RT_TABLE_ID"
-    uci commit network
-    /etc/init.d/network reload >/dev/null 2>&1 || true
-    sleep 2
-    log "  UCI-маршрут в table $RT_TABLE_ID создан"
-else
-    log "  ВНИМАНИЕ: awg не поднят — маршрут не создан"
+/etc/init.d/network reload >/dev/null 2>&1 ||
+    log "ВНИМАНИЕ: ошибка reload network"
+
+# ==================== 6. POLICY ROUTING HELPER ====================
+
+log "6. Установка helper..."
+
+POLICY_HELPER="/usr/bin/ensure_awg_policy.sh"
+HOTPLUG_HELPER="/etc/hotplug.d/iface/95-awg-policy"
+
+cat > "$POLICY_HELPER" << 'POLICY_EOF'
+#!/bin/sh
+
+TABLE="100"
+MARK="0x1"
+IFACE="awg"
+
+ip link show "$IFACE" >/dev/null 2>&1 || exit 1
+
+ip -4 route replace default dev "$IFACE" table "$TABLE" 2>/dev/null || exit 1
+
+if ! ip -4 rule show |
+    grep -Eq "fwmark ${MARK}([ /]|$).*lookup (${TABLE}|awg_vpn)([[:space:]]|$)"
+then
+    ip -4 rule add priority 10000 fwmark "${MARK}/0xffffffff" lookup "$TABLE" 2>/dev/null || {
+        ip -4 rule show |
+            grep -Eq "fwmark ${MARK}([ /]|$).*lookup (${TABLE}|awg_vpn)([[:space:]]|$)" || exit 1
+    }
 fi
 
-# ==================== 7. СНЯТИЕ ГАЛОЧКИ ====================
-log "7. Снятие route_allowed_ips (галочки)..."
+ip -4 route flush cache 2>/dev/null || true
+
+exit 0
+POLICY_EOF
+
+chmod 755 "$POLICY_HELPER"
+
+mkdir -p /etc/hotplug.d/iface
+
+cat > "$HOTPLUG_HELPER" << 'HOTPLUG_EOF'
+#!/bin/sh
+
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$INTERFACE" = "awg" ] || exit 0
+
+(
+    sleep 2
+    /usr/bin/ensure_awg_policy.sh
+) >/dev/null 2>&1 &
+
+exit 0
+HOTPLUG_EOF
+
+chmod 755 "$HOTPLUG_HELPER"
+
+log "Helper и hotplug установлены"
+
+ifup awg >/dev/null 2>&1 || true
+sleep 3
+
+if /usr/bin/ensure_awg_policy.sh; then
+    log "Маршрут и fwmark установлены"
+else
+    log "ВНИМАНИЕ: пока не удалось установить маршрут/fwmark"
+fi
+
+# ==================== 7. SELECTIVE ROUTING ====================
+
+log "7. Отключение route_allowed_ips..."
+
 uci set network.@amneziawg_awg[0].route_allowed_ips='0'
 uci commit network
 
-log "  route_allowed_ips=0, ifup wan, ifup awg, ждём handshake (до ${HANDSHAKE_TIMEOUT}s)..."
 ifup wan >/dev/null 2>&1 || true
+
 sleep 3
+
 ensure_wan_default
+
 ifup awg >/dev/null 2>&1 || true
 
 if wait_handshake; then
-    log "  handshake сохранился — выборочная маршрутизация активна"
 
-    # Убеждаемся, что UCI-правило применено netifd
-    if ! ip rule show | grep -q "fwmark $FWMARK lookup $RT_TABLE_ID"; then
-        log "  правило fwmark не найдено — перезапускаю network"
-        /etc/init.d/network reload >/dev/null 2>&1 || true
-        sleep 3
-        if ! ip rule show | grep -q "fwmark $FWMARK lookup $RT_TABLE_ID"; then
-            log "  правило всё ещё не найдено — добавляю вручную"
-            ip rule add fwmark "$FWMARK" lookup "$RT_TABLE_ID" 2>/dev/null || true
-        fi
+    log "Handshake сохранился"
+
+    if /usr/bin/ensure_awg_policy.sh; then
+        log "Policy routing активен"
+    else
+        log "ОШИБКА: policy routing не установлен"
     fi
 
-    # Убеждаемся, что маршрут в table 100 есть
-    if ip link show awg >/dev/null 2>&1; then
-        if ! ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default'; then
-            log "  маршрут в table $RT_TABLE_ID отсутствует — создаю вручную"
-            ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null || true
-        fi
-    fi
+    log "Перезапуск dnsmasq..."
 
-    # Перезапускаем dnsmasq ВСЕГДА после ifup wan (сокет мог стать невалидным)
-    log "  перезапускаю dnsmasq после ifup wan"
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+
     sleep 2
+
 else
-    log "  ВНИМАНИЕ: handshake не появился за ${HANDSHAKE_TIMEOUT}s после снятия галочки."
-    log "  На этой прошивке выборочная маршрутизация невозможна."
-    log "  Возвращаю route_allowed_ips=1 (полный туннель)..."
+
+    log "ВНИМАНИЕ: handshake потерян"
+    log "Возвращаем route_allowed_ips=1"
+
     uci set network.@amneziawg_awg[0].route_allowed_ips='1'
     uci commit network
+
     ifup wan >/dev/null 2>&1 || true
+
     sleep 3
+
     ensure_wan_default
+
     ifup awg >/dev/null 2>&1 || true
+
     if wait_handshake; then
-        log "  полный туннель восстановлен, handshake есть"
+        log "Полный туннель восстановлен"
     else
-        log "  ВНИМАНИЕ: handshake не восстановился и в полном туннеле."
-        log "  Проверьте: awg show, logread | grep -i awg, ping endpoint."
+        log "ОШИБКА: handshake не восстановился"
     fi
 fi
 
-# ==================== 8. UPDATE-СКРИПТ ====================
-log "8. Установка $UPDATE_SCRIPT..."
+# ==================== 8. UPDATE SCRIPT ====================
+
+log "8. Установка update-скрипта..."
+
 cat > "$UPDATE_SCRIPT" << 'UPD_EOF'
 #!/bin/sh
+
 LIST_URL="__LIST_URL__"
 LIST_MIRRORS="__MIRRORS__"
 DNS_TIMEOUT="__DNS_TIMEOUT__"
+
 TMP_RAW="/tmp/awg_list.raw"
 TMP_IPS="/tmp/awg_ips.tmp"
 TMP_NFT="/tmp/99-awg-domains.nft"
 FINAL_NFT="/etc/nftables.d/99-awg-domains.nft"
 
-log() { logger -t awg-updater "$*"; }
+log() {
+    logger -t awg-updater "$*"
+}
 
 resolve_host() {
     host="$1"
+
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$DNS_TIMEOUT" nslookup "$host" 2>/dev/null \
-            | awk '/^Address [0-9]+: / {print $3}' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+        timeout "$DNS_TIMEOUT" nslookup "$host" 2>/dev/null |
+            awk '/^Address [0-9]+: / {print $3}' |
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
     else
-        nslookup "$host" 2>/dev/null \
-            | awk '/^Address [0-9]+: / {print $3}' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+        nslookup "$host" 2>/dev/null |
+            awk '/^Address [0-9]+: / {print $3}' |
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
     fi
 }
 
 rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
 
 ok=0
+
 for url in "$LIST_URL" $LIST_MIRRORS; do
     [ -z "$url" ] && continue
+
     if command -v curl >/dev/null 2>&1; then
-        curl -4 -fsSL --connect-timeout 15 --max-time 180 -o "$TMP_RAW" "$url" && [ -s "$TMP_RAW" ] && { ok=1; break; }
+        curl -4 -fsSL --connect-timeout 15 --max-time 180 -o "$TMP_RAW" "$url" &&
+            [ -s "$TMP_RAW" ] && { ok=1; break; }
     else
-        wget -4 -q -T 180 -O "$TMP_RAW" "$url" && [ -s "$TMP_RAW" ] && { ok=1; break; }
+        wget -4 -q -T 180 -O "$TMP_RAW" "$url" &&
+            [ -s "$TMP_RAW" ] && { ok=1; break; }
     fi
+
     rm -f "$TMP_RAW"
 done
-[ "$ok" = "1" ] || { log "download failed (all mirrors)"; exit 1; }
+
+[ "$ok" = "1" ] || {
+    log "Download failed"
+    exit 1
+}
 
 ENTRIES=$(sed 's/\r//g; s/#.*//g; s/^[[:space:]]*//; s/[[:space:]]*$//' "$TMP_RAW" | grep -v '^$')
-[ -n "$ENTRIES" ] || { log "empty after clean"; exit 1; }
+
+[ -n "$ENTRIES" ] || {
+    log "Empty list"
+    exit 1
+}
 
 > "$TMP_IPS"
+
 echo "$ENTRIES" | while IFS= read -r entry; do
     [ -z "$entry" ] && continue
+
     if echo "$entry" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
         echo "$entry" >> "$TMP_IPS"
     else
         resolve_host "$entry" >> "$TMP_IPS" 2>/dev/null || true
+
         case "$entry" in
             www.*|*.*.*) ;;
             *) resolve_host "www.$entry" >> "$TMP_IPS" 2>/dev/null || true ;;
@@ -425,9 +568,15 @@ echo "$ENTRIES" | while IFS= read -r entry; do
     fi
 done
 
-sort -u "$TMP_IPS" -o "$TMP_IPS" 2>/dev/null || { sort -u "$TMP_IPS" > "$TMP_IPS.tmp" && mv "$TMP_IPS.tmp" "$TMP_IPS"; }
+sort -u "$TMP_IPS" -o "$TMP_IPS" 2>/dev/null ||
+    { sort -u "$TMP_IPS" > "$TMP_IPS.tmp" && mv "$TMP_IPS.tmp" "$TMP_IPS"; }
+
 SORTED_IPS=$(tr '\n' ',' < "$TMP_IPS" | sed 's/,$//')
-[ -n "$SORTED_IPS" ] || { log "no ips"; exit 1; }
+
+[ -n "$SORTED_IPS" ] || {
+    log "No IP addresses"
+    exit 1
+}
 
 cat > "$TMP_NFT" << NFT_EOF
 set vpn_domains {
@@ -444,37 +593,60 @@ chain mangle_prerouting_awg {
 NFT_EOF
 
 if ! cmp -s "$TMP_NFT" "$FINAL_NFT"; then
+
     cp "$TMP_NFT" "$FINAL_NFT"
-    /etc/init.d/firewall restart >/dev/null 2>&1
-    log "updated, firewall restarted ($(wc -l < "$TMP_IPS") IP)"
+
+    if /etc/init.d/firewall restart >/dev/null 2>&1; then
+        log "Updated: $(wc -l < "$TMP_IPS") IP"
+    else
+        log "ERROR: firewall restart failed"
+        exit 1
+    fi
+
 else
-    log "no changes"
+    log "No changes"
 fi
 
 rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
+
+exit 0
 UPD_EOF
 
 sed -i "s|__LIST_URL__|$LIST_URL|" "$UPDATE_SCRIPT"
+
 MIRRORS_ONELINE=$(echo "$LIST_MIRRORS" | tr '\n' ' ')
+
 sed -i "s|__MIRRORS__|$MIRRORS_ONELINE|" "$UPDATE_SCRIPT"
 sed -i "s|__DNS_TIMEOUT__|$DNS_TIMEOUT|" "$UPDATE_SCRIPT"
+
 chmod +x "$UPDATE_SCRIPT"
 
 # ==================== 9. CRON ====================
+
 log "9. Настройка cron..."
+
 mkdir -p /etc/crontabs
 touch /etc/crontabs/root
+
 sed -i "\|$UPDATE_SCRIPT|d" /etc/crontabs/root
+
 echo "0 4 * * * $UPDATE_SCRIPT" >> /etc/crontabs/root
-# восстановление маршрута и правила после перезагрузки (netifd может не успеть)
-sed -i '\|ip route replace default dev awg table '"$RT_TABLE_ID"'|d' /etc/crontabs/root
-echo "@reboot sleep 30 && ip route replace default dev awg table $RT_TABLE_ID" >> /etc/crontabs/root
-sed -i '\|ip rule add fwmark '"$FWMARK"' lookup '"$RT_TABLE_ID"'|d' /etc/crontabs/root
-echo "@reboot sleep 32 && ip rule add fwmark $FWMARK lookup $RT_TABLE_ID 2>/dev/null || true" >> /etc/crontabs/root
+
+sed -i '\|ensure_awg_policy.sh|d' /etc/crontabs/root
+
+echo "@reboot sleep 35 && /usr/bin/ensure_awg_policy.sh >/dev/null 2>&1" >> /etc/crontabs/root
+
 /etc/init.d/cron enable
 /etc/init.d/cron restart
 
-log "Готово. Список: $IP_COUNT IP. Зона awg, forwarding, nft-set, fwmark -> table $RT_TABLE_ID настроены."
-log "Маршрут в table $RT_TABLE_ID: $(ip route show table $RT_TABLE_ID 2>/dev/null | head -1)"
-log "Правило fwmark: $(ip rule show 2>/dev/null | grep "fwmark $FWMARK lookup $RT_TABLE_ID" | head -1)"
+# ==================== DONE ====================
+
+log "Готово. Список: $IP_COUNT IP"
+
+log "Маршрут:"
+ip -4 route show table "$RT_TABLE_ID" 2>/dev/null
+
+log "Правило:"
+ip -4 rule show 2>/dev/null
+
 log "Проверка: sh /usr/bin/check_vpn.sh"
