@@ -226,20 +226,27 @@ command -v uci >/dev/null 2>&1 || die "uci не найден"
 command -v awg >/dev/null 2>&1 || die "awg не найден (amneziawg-tools)"
 uci -q get network.awg >/dev/null 2>&1 || die "network.awg не настроен — сначала настройте AmneziaWG в LuCI"
 
-# Проверка DNS с ожиданием до 20 секунд
+# Проверка DNS с ожиданием до 30 секунд (без принудительного restart на 3-й попытке)
 dns_ok=0
-for i in 1 2 3 4 5 6 7 8 9 10; do
-    if timeout "$DNS_TIMEOUT" nslookup google.com >/dev/null 2>&1; then
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if timeout "$DNS_TIMEOUT" nslookup google.com 127.0.0.1 >/dev/null 2>&1; then
         dns_ok=1
         break
     fi
-    if [ "$i" = "3" ]; then
-        log "ВНИМАНИЕ: dnsmasq не отвечает — перезапускаю..."
-        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-    fi
     sleep 2
 done
-[ "$dns_ok" = "1" ] || log "ВНИМАНИЕ: dnsmasq не ответил за 20s — загрузка списка может упасть"
+if [ "$dns_ok" = "1" ]; then
+    log "  dnsmasq отвечает"
+else
+    log "ВНИМАНИЕ: dnsmasq не ответил за 30s — пробую перезапустить один раз"
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    sleep 5
+    if timeout "$DNS_TIMEOUT" nslookup google.com 127.0.0.1 >/dev/null 2>&1; then
+        log "  dnsmasq заработал после перезапуска"
+    else
+        log "ВНИМАНИЕ: dnsmasq не отвечает даже после перезапуска — загрузка списка может упасть"
+    fi
+fi
 
 # ==================== 2. HANDSHAKE ====================
 log "2. Обеспечение handshake..."
@@ -259,7 +266,6 @@ fi
 
 # ==================== 3. СКАЧИВАНИЕ ====================
 log "3. Скачивание списка..."
-# Проверка маршрута по умолчанию перед загрузкой
 ensure_wan_default
 rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_NFT"
 fetch_list "$TMP_RAW" || die "не удалось скачать список ни с одного зеркала"
@@ -332,13 +338,11 @@ uci commit network
 log "  route_allowed_ips=0, network restart, ждём handshake (до ${HANDSHAKE_TIMEOUT}s)..."
 /etc/init.d/network restart >/dev/null 2>&1 || log "  ВНИМАНИЕ: network restart вернул ошибку"
 sleep 5
-# После network restart маршрут по умолчанию через WAN мог не восстановиться
 ensure_wan_default
 ifup awg >/dev/null 2>&1 || true
 
 if wait_handshake; then
     log "  handshake сохранился — выборочная маршрутизация активна"
-    # Восстановление маршрута в table 100, если network restart его удалил
     if ip link show awg >/dev/null 2>&1; then
         ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default' \
             || ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null || true
