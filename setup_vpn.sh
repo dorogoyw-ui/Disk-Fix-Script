@@ -184,7 +184,6 @@ ensure_forwarding() {
     fi
 }
 
-# Ждём handshake до $HANDSHAKE_TIMEOUT секунд. Возвращает 0, если появился.
 wait_handshake() {
     elapsed=0
     while [ "$elapsed" -lt "$HANDSHAKE_TIMEOUT" ]; do
@@ -297,17 +296,26 @@ fi
 log "8. Снятие route_allowed_ips (галочки)..."
 uci set network.@amneziawg_awg[0].route_allowed_ips='0'
 uci commit network
+
+log "  route_allowed_ips=0, restart wan, ifup awg, ждём handshake (до ${HANDSHAKE_TIMEOUT}s)..."
+/etc/init.d/network restart >/dev/null 2>&1 || log "  ВНИМАНИЕ: network restart вернул ошибку"
+sleep 5
 ifup awg >/dev/null 2>&1 || true
-log "  route_allowed_ips=0, ifup awg, ждём handshake (до ${HANDSHAKE_TIMEOUT}s)..."
 
 if wait_handshake; then
     log "  handshake сохранился — выборочная маршрутизация активна"
+    if ip link show awg >/dev/null 2>&1; then
+        ip route show table "$RT_TABLE_ID" 2>/dev/null | grep -q '^default' \
+            || ip route replace default dev awg table "$RT_TABLE_ID" 2>/dev/null || true
+    fi
 else
     log "  ВНИМАНИЕ: handshake не появился за ${HANDSHAKE_TIMEOUT}s после снятия галочки."
     log "  На этой прошивке выборочная маршрутизация невозможна."
     log "  Возвращаю route_allowed_ips=1 (полный туннель)..."
     uci set network.@amneziawg_awg[0].route_allowed_ips='1'
     uci commit network
+    /etc/init.d/network restart >/dev/null 2>&1 || true
+    sleep 5
     ifup awg >/dev/null 2>&1 || true
     if wait_handshake; then
         log "  полный туннель восстановлен, handshake есть"
@@ -416,7 +424,6 @@ mkdir -p /etc/crontabs
 touch /etc/crontabs/root
 sed -i "\|$UPDATE_SCRIPT|d" /etc/crontabs/root
 echo "0 4 * * * $UPDATE_SCRIPT" >> /etc/crontabs/root
-# восстановление маршрута в table 100 после перезагрузки
 sed -i '\|ip route replace default dev awg table '"$RT_TABLE_ID"'|d' /etc/crontabs/root
 echo "@reboot sleep 30 && ip route replace default dev awg table $RT_TABLE_ID" >> /etc/crontabs/root
 /etc/init.d/cron enable
