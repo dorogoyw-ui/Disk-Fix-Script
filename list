@@ -1,138 +1,446 @@
+```text
 # ==========================================
-# СТАТИЧЕСКИЕ ПОДСЕТИ (ДЛЯ CDN, ВИДЕО И ЗВОНКОВ)
+# СТАТИЧЕСКИЕ ПОДСЕТИ
 # ==========================================
 
-# YouTube и сервисы Google (видеопотоки googlevideo)
+# Google, YouTube, видеопотоки и CDN
 142.250.0.0/15
 172.217.0.0/16
 216.58.192.0/19
 74.125.0.0/16
 
-# Instagram, Facebook и Threads (фото и видео Meta CDN)
+# Meta: Instagram, Facebook, Threads, WhatsApp
 157.240.0.0/16
 31.13.24.0/21
 31.13.64.0/18
 185.60.216.0/22
 
-# Telegram (дата-центры, медиа и голосовые звонки)
+# Telegram — актуальные IPv4-подсети
+91.105.192.0/23
 91.108.4.0/22
 91.108.8.0/22
 91.108.12.0/22
 91.108.16.0/22
+91.108.20.0/22
 91.108.56.0/22
 149.154.160.0/20
+185.76.151.0/24
 
 # ==========================================
-# ДОМЕННЫЕ ИМЕНА
+# YOUTUBE И GOOGLE
 # ==========================================
 
-# YouTube и видеосервисы
 youtube.com
 youtu.be
-vimeo.com
-vimeocdn.com
+youtube-nocookie.com
+youtubei.googleapis.com
+youtube.googleapis.com
+youtubeembeddedplayer.googleapis.com
+youtube-ui.l.google.com
+youtube.l.google.com
+wide-youtube.l.google.com
+youtubekids.com
 
-# Telegram
+# Превью, изображения и аватары YouTube
+ytimg.com
+i.ytimg.com
+img.youtube.com
+s.ytimg.com
+yt3.ggpht.com
+ggpht.com
+
+# Видеопотоки
+googlevideo.com
+
+# Google API, изображения и статические ресурсы
+google.com
+googleapis.com
+gstatic.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.l.google.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+googleusercontent.com
+
+# ==========================================
+# INSTAGRAM, FACEBOOK, THREADS, WHATSAPP
+# ==========================================
+
+instagram.com
+cdninstagram.com
+facebook.com
+facebook.net
+fb.com
+fb.me
+fbcdn.net
+fbsbx.com
+facebookmail.com
+staticxx.facebook.com
+messenger.com
+m.me
+threads.net
+threads.com
+meta.com
+
+# WhatsApp
+whatsapp.com
+whatsapp.net
+wa.me
+
+# ==========================================
+# TELEGRAM
+# ==========================================
+
 telegram.org
 t.me
 telegra.ph
 tdesktop.com
 telegram.me
+telegram.dog
+telegram.space
+telesco.pe
 
-# Instagram и Meta
-instagram.com
-facebook.com
-threads.net
-meta.com
+# ==========================================
+# X / TWITTER
+# ==========================================
 
-# X (Twitter)
 x.com
 twitter.com
 twimg.com
 t.co
+twttr.com
+pscp.tv
+periscope.tv
+api.twitter.com
+ads-twitter.com
+vine.co
 
-# Discord
+# ==========================================
+# DISCORD
+# ==========================================
+
 discord.com
+discord.gg
 discordapp.com
 discordapp.net
-discord.gg
 discord.media
+discordcdn.com
+discord.gift
+discord.new
+discordstatus.com
 
-# ИИ-сервисы (ChatGPT, Claude, Gemini, Midjourney, Perplexity, Hugging Face)
+# ==========================================
+# TIKTOK
+# ==========================================
+
+tiktok.com
+tiktokv.com
+tiktokcdn.com
+tiktokcdn-eu.com
+tiktokcdn-us.com
+tiktokv.eu
+tiktokv.us
+tiktokw.eu
+tiktokw.us
+tiktokstaticb.com
+ttwstatic.com
+byteoversea.com
+ibytedtos.com
+ibyteimg.com
+musical.ly
+douyin.com
+douyincdn.com
+douyinpic.com
+douyinstatic.com
+douyinvod.com
+
+# ==========================================
+# ИИ-СЕРВИСЫ
+# ==========================================
+
+# OpenAI / ChatGPT
 openai.com
 chatgpt.com
+chat.openai.com
 oaistatic.com
 oaiusercontent.com
+files.oaiusercontent.com
+auth.openai.com
+platform.openai.com
+
+# Anthropic / Claude
 anthropic.com
 claude.ai
+
+# Google Gemini
 gemini.google.com
 aistudio.google.com
+ai.google.dev
+
+# Midjourney
 midjourney.com
+
+# Perplexity
 perplexity.ai
+
+# Hugging Face
 huggingface.co
 hf.co
+hf.space
+
+# Civitai
 civitai.com
 
-# Игровые платформы и мобильные игры
+# Grok
+grok.com
+x.ai
+
+# Microsoft Copilot
+copilot.microsoft.com
+
+# ==========================================
+# ИГРОВЫЕ ПЛАТФОРМЫ
+# ==========================================
+
+# Steam
+steampowered.com
 steamcommunity.com
+steamstatic.com
+steamcontent.com
+steamserver.net
+steamusercontent.com
+
+# Epic Games
 epicgames.com
+epicgames.dev
 unrealengine.com
+unrealtournament.com
+
+# Supercell
 supercell.com
 brawlstars.com
 clashroyale.com
 clashofclans.com
+
+# PlayStation
 playstation.com
 sonyentertainmentnetwork.com
+playstation.net
+sony.com
+
+# Xbox
 xbox.com
+xboxlive.com
+xboxservices.com
+microsoft.com
+
+# EA
 ea.com
+origin.com
+easports.com
+
+# Ubisoft
 ubisoft.com
+ubi.com
+
+# Riot Games
 riotgames.com
 leagueoflegends.com
 valorant.com
+playvalorant.com
+riotcdn.net
+
+# Roblox
 roblox.com
 rbxcdn.com
-nexusmods.com
+robloxcdn.com
 
-# Разработка, облака и IT-инструменты
-docker.com
-docker.io
-jetbrains.com
+# Моды и игровые ресурсы
+nexusmods.com
+nexus-cdn.com
+curseforge.com
+modrinth.com
+
+# ==========================================
+# РАЗРАБОТКА, ОБЛАКА И IT
+# ==========================================
+
+github.com
 githubusercontent.com
+githubassets.com
+github.io
 gitlab.com
+gitlab.io
+bitbucket.org
 stackoverflow.com
+stackexchange.com
 medium.com
 dev.to
+
+# Docker
+docker.com
+docker.io
+dockerstatic.com
+
+# JetBrains
+jetbrains.com
+jetbrains.net
+
+# Облачные платформы
 digitalocean.com
 cloudflare.com
+cloudflare-dns.com
+vercel.com
+netlify.com
+render.com
+railway.app
+fly.io
+supabase.com
+firebase.google.com
+firebaseapp.com
 
-# Музыка, кино, соцсети и торренты
+# ==========================================
+# МУЗЫКА И АУДИО
+# ==========================================
+
+# Spotify
 spotify.com
 scdn.co
-netflix.com
-nflxvideo.net
+spotifycdn.com
+spotifycdn.net
+pscdn.co
+akamaized.net
+
+# SoundCloud
 soundcloud.com
 sndcdn.com
+
+# Deezer
+deezer.com
+dzcdn.net
+
+# Apple Music
+music.apple.com
+itunes.apple.com
+mzstatic.com
+
+# ==========================================
+# ВИДЕО И КИНО
+# ==========================================
+
+# Netflix
+netflix.com
+netflix.net
+nflxvideo.net
+nflximg.com
+nflximg.net
+nflxext.com
+nflxso.net
+
+# Vimeo
+vimeo.com
+vimeocdn.com
+vimeostatic.com
+
+# Twitch
+twitch.tv
+twitchcdn.net
+jtvnw.net
+ttvnw.net
+twitchsvc.net
+
+# ==========================================
+# СОЦСЕТИ И МЕДИА
+# ==========================================
+
+# LinkedIn
 linkedin.com
 licdn.com
+
+# Pinterest
 pinterest.com
 pinimg.com
-rutracker.org
-nnmclub.to
-rutor.info
-flibusta.is
+
+# Reddit
+reddit.com
+redditmedia.com
+redditstatic.com
+redd.it
+
+# Tumblr
+tumblr.com
+tumblr.co
+
+# Flickr
+flickr.com
+staticflickr.com
+
+# Patreon / Boosty
 patreon.com
+patreonusercontent.com
 boosty.to
+
+# Behance / Dribbble
 behance.net
+behance.com
 dribbble.com
 
-# Рабочие инструменты, почта и утилиты
+# ==========================================
+# РАБОЧИЕ ИНСТРУМЕНТЫ
+# ==========================================
+
 notion.so
+notion.com
+notion.site
+notion-static.com
 canva.com
 figma.com
 trello.com
 miro.com
+slack.com
+slack-edge.com
+zoom.us
+webex.com
+
+# ==========================================
+# ПОЧТА И КОНФИДЕНЦИАЛЬНОСТЬ
+# ==========================================
+
 proton.me
 protonmail.com
+protonmail.ch
 tuta.com
+tutanota.com
+
+# ==========================================
+# ТОРРЕНТЫ И ФАЙЛОВЫЕ РЕСУРСЫ
+# ==========================================
+
+rutracker.org
+nnmclub.to
+rutor.info
+flibusta.is
+
+# ==========================================
+# ПРОЧЕЕ
+# ==========================================
+
 speedtest.net
 2ip.ru
+wikipedia.org
+wikimedia.org
+archive.org
+```
